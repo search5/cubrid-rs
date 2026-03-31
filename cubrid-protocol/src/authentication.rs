@@ -856,4 +856,37 @@ mod tests {
             "CAS and DBMS errors with same code/message must produce different strings"
         );
     }
+
+    #[test]
+    fn test_broker_info_function_flag() {
+        let raw = [1, 0, 0, 0, 0x47, 0xC0, 0, 0]; // V7, flags=0xC0
+        let info = BrokerInfo::from_bytes(raw);
+        assert_eq!(info.function_flag(), 0xC0);
+        assert!(info.supports_renewed_error_code());
+    }
+
+    #[test]
+    fn test_parse_open_db_response_truncated_before_response_code() {
+        // response_length that claims 8 bytes of body (4 cas_info + 4 payload)
+        // but only provide cas_info (4 bytes), no response code
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&8i32.to_be_bytes()); // response_length
+        buf.extend_from_slice(&[0u8; 4]); // cas_info
+        // No response code bytes — should error with UnexpectedLength
+        let result = parse_open_database_response(&buf);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_open_db_response_error_short_payload() {
+        // Error response where first_int < 0 but only 4 bytes available
+        // (the error indicator itself, no error_code follows)
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&8i32.to_be_bytes()); // response_length = 8
+        buf.extend_from_slice(&[0u8; 4]); // cas_info
+        buf.extend_from_slice(&(-1i32).to_be_bytes()); // first_int = -1 (CAS error)
+        // No further bytes for error_code — falls back to first_int as code
+        let result = parse_open_database_response(&buf);
+        assert!(result.is_err());
+    }
 }

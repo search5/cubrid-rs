@@ -779,6 +779,55 @@ mod tests {
         assert!(debug.contains("33000"));
     }
 
+    // -----------------------------------------------------------------------
+    // URL-format edge cases for uncovered lines
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_url_no_dbname() {
+        // URL with no slash/dbname part: "cubrid://dba@localhost:33000"
+        let config: Config = "cubrid://dba@localhost:33000".parse().unwrap();
+        assert_eq!(config.get_hosts(), &["localhost"]);
+        assert_eq!(config.get_port(), 33000);
+        assert_eq!(config.get_dbname(), ""); // no dbname
+    }
+
+    #[test]
+    fn test_parse_url_ipv6_empty_host() {
+        // IPv6 with empty brackets: "cubrid://dba@[]:33000/demodb"
+        let err: Result<Config, _> = "cubrid://dba@[]:33000/demodb".parse();
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("host"));
+    }
+
+    #[test]
+    fn test_parse_url_ipv6_invalid_port() {
+        // IPv6 with non-numeric port: "cubrid://dba@[::1]:abc/demodb"
+        let err: Result<Config, _> = "cubrid://dba@[::1]:abc/demodb".parse();
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("port"));
+    }
+
+    #[test]
+    fn test_parse_url_empty_host_with_port() {
+        // Empty host with port: "cubrid://dba@:33000/demodb"
+        let err: Result<Config, _> = "cubrid://dba@:33000/demodb".parse();
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("host"));
+    }
+
+    #[test]
+    fn test_parse_url_invalid_port() {
+        // Non-numeric port: "cubrid://dba@localhost:xyz/demodb"
+        let err: Result<Config, _> = "cubrid://dba@localhost:xyz/demodb".parse();
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("port"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Clone / Debug
+    // -----------------------------------------------------------------------
+
     #[test]
     fn test_config_debug_masks_password() {
         let mut config = Config::new();

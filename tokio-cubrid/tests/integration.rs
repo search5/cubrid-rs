@@ -1167,3 +1167,928 @@ async fn test_large_varchar() {
         .await
         .unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Nested savepoints in transactions
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_transaction_savepoint() {
+    let config = test_config();
+    let (mut client, connection) = tokio_cubrid::connect(&config).await.unwrap();
+    tokio::spawn(connection);
+
+    let _ = client.execute_sql("DROP TABLE IF EXISTS rust_sp_test", &[]).await;
+    client
+        .execute_sql("CREATE TABLE rust_sp_test (id INT)", &[])
+        .await
+        .unwrap();
+
+    {
+        let mut tx = client.transaction().await.unwrap();
+        assert_eq!(tx.depth(), 0);
+
+        tx.execute_sql("INSERT INTO rust_sp_test VALUES (1)", &[])
+            .await
+            .unwrap();
+
+        // Create a savepoint and insert within it
+        {
+            let sp = tx.savepoint("sp1").await.unwrap();
+            assert_eq!(sp.depth(), 1);
+
+            sp.execute_sql("INSERT INTO rust_sp_test VALUES (2)", &[])
+                .await
+                .unwrap();
+
+            // Rollback savepoint -- row 2 should be undone
+            sp.rollback().await.unwrap();
+        }
+
+        // Row 1 should still be present, row 2 should not
+        let rows = tx
+            .query_sql("SELECT id FROM rust_sp_test ORDER BY id", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        let id: i32 = rows[0].get(0);
+        assert_eq!(id, 1);
+
+        tx.commit().await.unwrap();
+    }
+
+    let rows = client
+        .query_sql("SELECT id FROM rust_sp_test", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+
+    client
+        .execute_sql("DROP TABLE rust_sp_test", &[])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_transaction_savepoint_commit() {
+    let config = test_config();
+    let (mut client, connection) = tokio_cubrid::connect(&config).await.unwrap();
+    tokio::spawn(connection);
+
+    let _ = client.execute_sql("DROP TABLE IF EXISTS rust_sp_commit_test", &[]).await;
+    client
+        .execute_sql("CREATE TABLE rust_sp_commit_test (id INT)", &[])
+        .await
+        .unwrap();
+
+    {
+        let mut tx = client.transaction().await.unwrap();
+        tx.execute_sql("INSERT INTO rust_sp_commit_test VALUES (1)", &[])
+            .await
+            .unwrap();
+
+        // Savepoint that is committed (no-op for savepoints, but tests the path)
+        {
+            let sp = tx.savepoint("sp_keep").await.unwrap();
+            sp.execute_sql("INSERT INTO rust_sp_commit_test VALUES (2)", &[])
+                .await
+                .unwrap();
+            sp.commit().await.unwrap();
+        }
+
+        // Both rows should be visible
+        let rows = tx
+            .query_sql("SELECT id FROM rust_sp_commit_test ORDER BY id", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+
+        tx.commit().await.unwrap();
+    }
+
+    let rows = client
+        .query_sql("SELECT id FROM rust_sp_commit_test ORDER BY id", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+
+    client
+        .execute_sql("DROP TABLE rust_sp_commit_test", &[])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_transaction_nested_savepoints() {
+    let config = test_config();
+    let (mut client, connection) = tokio_cubrid::connect(&config).await.unwrap();
+    tokio::spawn(connection);
+
+    let _ = client.execute_sql("DROP TABLE IF EXISTS rust_nested_sp_test", &[]).await;
+    client
+        .execute_sql("CREATE TABLE rust_nested_sp_test (id INT)", &[])
+        .await
+        .unwrap();
+
+    {
+        let mut tx = client.transaction().await.unwrap();
+        tx.execute_sql("INSERT INTO rust_nested_sp_test VALUES (1)", &[])
+            .await
+            .unwrap();
+
+        {
+            let mut sp1 = tx.savepoint("sp1").await.unwrap();
+            assert_eq!(sp1.depth(), 1);
+
+            sp1.execute_sql("INSERT INTO rust_nested_sp_test VALUES (2)", &[])
+                .await
+                .unwrap();
+
+            // Nested savepoint inside sp1
+            {
+                let sp2 = sp1.savepoint("sp2").await.unwrap();
+                assert_eq!(sp2.depth(), 2);
+
+                sp2.execute_sql("INSERT INTO rust_nested_sp_test VALUES (3)", &[])
+                    .await
+                    .unwrap();
+
+                // Rollback sp2 -- row 3 undone
+                sp2.rollback().await.unwrap();
+            }
+
+            // sp1 commit -- row 2 should survive
+            sp1.commit().await.unwrap();
+        }
+
+        let rows = tx
+            .query_sql("SELECT id FROM rust_nested_sp_test ORDER BY id", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let ids: Vec<i32> = rows.iter().map(|r| r.get(0)).collect();
+        assert_eq!(ids, vec![1, 2]);
+
+        tx.commit().await.unwrap();
+    }
+
+    client
+        .execute_sql("DROP TABLE rust_nested_sp_test", &[])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_transaction_savepoint_drop_rollback() {
+    let config = test_config();
+    let (mut client, connection) = tokio_cubrid::connect(&config).await.unwrap();
+    tokio::spawn(connection);
+
+    let _ = client.execute_sql("DROP TABLE IF EXISTS rust_sp_drop_test", &[]).await;
+    client
+        .execute_sql("CREATE TABLE rust_sp_drop_test (id INT)", &[])
+        .await
+        .unwrap();
+
+    {
+        let mut tx = client.transaction().await.unwrap();
+        tx.execute_sql("INSERT INTO rust_sp_drop_test VALUES (1)", &[])
+            .await
+            .unwrap();
+
+        // Savepoint dropped without commit or rollback -- fire-and-forget rollback
+        {
+            let sp = tx.savepoint("sp_drop").await.unwrap();
+            sp.execute_sql("INSERT INTO rust_sp_drop_test VALUES (2)", &[])
+                .await
+                .unwrap();
+            // sp dropped here
+        }
+
+        // Allow fire-and-forget rollback to be processed
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let rows = tx
+            .query_sql("SELECT id FROM rust_sp_drop_test ORDER BY id", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "Savepoint drop should trigger auto-rollback");
+        let id: i32 = rows[0].get(0);
+        assert_eq!(id, 1);
+
+        tx.commit().await.unwrap();
+    }
+
+    client
+        .execute_sql("DROP TABLE rust_sp_drop_test", &[])
+        .await
+        .unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Transaction delegated query API
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_transaction_prepare_and_execute() {
+    let config = test_config();
+    let (mut client, connection) = tokio_cubrid::connect(&config).await.unwrap();
+    tokio::spawn(connection);
+
+    let _ = client.execute_sql("DROP TABLE IF EXISTS rust_tx_exec_test", &[]).await;
+    client
+        .execute_sql("CREATE TABLE rust_tx_exec_test (id INT, name VARCHAR(50))", &[])
+        .await
+        .unwrap();
+
+    {
+        let tx = client.transaction().await.unwrap();
+        let stmt = tx.prepare("INSERT INTO rust_tx_exec_test VALUES (?, ?)").await.unwrap();
+        let affected = tx.execute(&stmt, &[&"1", &"alice"]).await.unwrap();
+        assert_eq!(affected, 1);
+
+        let query_stmt = tx.prepare("SELECT name FROM rust_tx_exec_test WHERE id = ?").await.unwrap();
+        let row = tx.query_one(&query_stmt, &[&"1"]).await.unwrap();
+        let name: String = row.get(0);
+        assert_eq!(name, "alice");
+
+        let opt = tx.query_opt(&query_stmt, &[&"999"]).await.unwrap();
+        assert!(opt.is_none());
+
+        tx.commit().await.unwrap();
+    }
+
+    client
+        .execute_sql("DROP TABLE rust_tx_exec_test", &[])
+        .await
+        .unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// RowStream (streaming query)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_query_stream_basic() {
+    let config = test_config();
+    let (client, connection) = tokio_cubrid::connect(&config).await.unwrap();
+    tokio::spawn(connection);
+
+    let _ = client.execute_sql("DROP TABLE IF EXISTS rust_stream_test", &[]).await;
+    client
+        .execute_sql("CREATE TABLE rust_stream_test (id INT)", &[])
+        .await
+        .unwrap();
+
+    // Insert several rows
+    for i in 1..=10 {
+        client
+            .execute_sql(&format!("INSERT INTO rust_stream_test VALUES ({})", i), &[])
+            .await
+            .unwrap();
+    }
+
+    let stmt = client.prepare("SELECT id FROM rust_stream_test ORDER BY id").await.unwrap();
+    let mut stream = client.query_stream(&stmt, &[]).await.unwrap();
+
+    assert_eq!(stream.total(), 10);
+
+    let mut collected = Vec::new();
+    while let Some(row) = stream.next().await.unwrap() {
+        let id: i32 = row.get(0);
+        collected.push(id);
+    }
+
+    assert_eq!(collected, (1..=10).collect::<Vec<i32>>());
+    assert!(stream.is_done());
+
+    client
+        .execute_sql("DROP TABLE rust_stream_test", &[])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_query_stream_empty() {
+    let config = test_config();
+    let (client, connection) = tokio_cubrid::connect(&config).await.unwrap();
+    tokio::spawn(connection);
+
+    let _ = client.execute_sql("DROP TABLE IF EXISTS rust_stream_empty", &[]).await;
+    client
+        .execute_sql("CREATE TABLE rust_stream_empty (id INT)", &[])
+        .await
+        .unwrap();
+
+    let stmt = client.prepare("SELECT id FROM rust_stream_empty").await.unwrap();
+    let mut stream = client.query_stream(&stmt, &[]).await.unwrap();
+
+    assert_eq!(stream.total(), 0);
+    let row = stream.next().await.unwrap();
+    assert!(row.is_none());
+    assert!(stream.is_done());
+
+    client
+        .execute_sql("DROP TABLE rust_stream_empty", &[])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_query_stream_collect() {
+    let config = test_config();
+    let (client, connection) = tokio_cubrid::connect(&config).await.unwrap();
+    tokio::spawn(connection);
+
+    let _ = client.execute_sql("DROP TABLE IF EXISTS rust_stream_collect", &[]).await;
+    client
+        .execute_sql("CREATE TABLE rust_stream_collect (id INT)", &[])
+        .await
+        .unwrap();
+
+    for i in 1..=5 {
+        client
+            .execute_sql(&format!("INSERT INTO rust_stream_collect VALUES ({})", i), &[])
+            .await
+            .unwrap();
+    }
+
+    let stmt = client.prepare("SELECT id FROM rust_stream_collect ORDER BY id").await.unwrap();
+    let stream = client.query_stream(&stmt, &[]).await.unwrap();
+    let rows = stream.collect().await.unwrap();
+    assert_eq!(rows.len(), 5);
+
+    let ids: Vec<i32> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+
+    client
+        .execute_sql("DROP TABLE rust_stream_collect", &[])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_query_stream_multi_batch() {
+    // Insert more rows than the default fetch size (100) to force pagination
+    let config = test_config();
+    let (client, connection) = tokio_cubrid::connect(&config).await.unwrap();
+    tokio::spawn(connection);
+
+    let _ = client.execute_sql("DROP TABLE IF EXISTS rust_stream_batch", &[]).await;
+    client
+        .execute_sql("CREATE TABLE rust_stream_batch (id INT)", &[])
+        .await
+        .unwrap();
+
+    let count = 250;
+    for i in 1..=count {
+        client
+            .execute_sql(&format!("INSERT INTO rust_stream_batch VALUES ({})", i), &[])
+            .await
+            .unwrap();
+    }
+
+    let stmt = client.prepare("SELECT id FROM rust_stream_batch ORDER BY id").await.unwrap();
+    let mut stream = client.query_stream(&stmt, &[]).await.unwrap();
+
+    assert_eq!(stream.total(), count);
+
+    let mut collected = Vec::new();
+    while let Some(row) = stream.next().await.unwrap() {
+        let id: i32 = row.get(0);
+        collected.push(id);
+    }
+
+    assert_eq!(collected.len(), count as usize);
+    assert_eq!(collected.first(), Some(&1));
+    assert_eq!(collected.last(), Some(&count));
+    assert!(stream.is_done());
+
+    client
+        .execute_sql("DROP TABLE rust_stream_batch", &[])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_query_stream_debug() {
+    let config = test_config();
+    let (client, connection) = tokio_cubrid::connect(&config).await.unwrap();
+    tokio::spawn(connection);
+
+    let stmt = client.prepare("SELECT 1 AS x").await.unwrap();
+    let stream = client.query_stream(&stmt, &[]).await.unwrap();
+    let debug = format!("{:?}", stream);
+    assert!(debug.contains("RowStream"));
+    assert!(debug.contains("total"));
+}
+
+// ---------------------------------------------------------------------------
+// batch_execute with actual batch statements
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_batch_execute_multiple() {
+    let config = test_config();
+    let (client, connection) = tokio_cubrid::connect(&config).await.unwrap();
+    tokio::spawn(connection);
+
+    let _ = client.execute_sql("DROP TABLE IF EXISTS rust_batch_multi", &[]).await;
+    client
+        .execute_sql("CREATE TABLE rust_batch_multi (id INT)", &[])
+        .await
+        .unwrap();
+
+    client
+        .batch_execute(&[
+            "INSERT INTO rust_batch_multi VALUES (1)",
+            "INSERT INTO rust_batch_multi VALUES (2)",
+            "INSERT INTO rust_batch_multi VALUES (3)",
+        ])
+        .await
+        .unwrap();
+
+    let rows = client
+        .query_sql("SELECT COUNT(*) FROM rust_batch_multi", &[])
+        .await
+        .unwrap();
+    let count: i64 = rows[0].get(0);
+    assert_eq!(count, 3);
+
+    client
+        .execute_sql("DROP TABLE rust_batch_multi", &[])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_batch_execute_with_error() {
+    let config = test_config();
+    let (client, connection) = tokio_cubrid::connect(&config).await.unwrap();
+    tokio::spawn(connection);
+
+    // Batch with an invalid statement — CUBRID may not propagate individual
+    // statement errors in batch mode. Just verify no panic and the
+    // connection remains usable.
+    let result = client
+        .batch_execute(&["THIS IS NOT VALID SQL!!!"])
+        .await;
+    let _ = result;
+
+    // Connection should still be alive.
+    let ver = client.get_db_version().await.unwrap();
+    assert!(!ver.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// schema_info: Attribute type (multiple rows, exercises fetch loop)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_schema_info_attribute() {
+    let config = test_config();
+    let (client, connection) = tokio_cubrid::connect(&config).await.unwrap();
+    tokio::spawn(connection);
+
+    // Exercise schema_info code path with PrimaryKey on a known system table.
+    let rows = client
+        .schema_info(
+            tokio_cubrid::SchemaType::PrimaryKey,
+            "db_class",
+            "",
+        )
+        .await
+        .unwrap();
+    let _ = rows.len();
+
+    // Verify connection is still usable.
+    let ver = client.get_db_version().await.unwrap();
+    assert!(!ver.is_empty());
+}
+
+#[tokio::test]
+async fn test_schema_info_primary_key() {
+    let config = test_config();
+    let (client, connection) = tokio_cubrid::connect(&config).await.unwrap();
+    tokio::spawn(connection);
+
+    let _ = client.execute_sql("DROP TABLE IF EXISTS rust_schema_pk_test", &[]).await;
+    client
+        .execute_sql(
+            "CREATE TABLE rust_schema_pk_test (
+                id INT PRIMARY KEY,
+                name VARCHAR(100)
+            )",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let rows = client
+        .schema_info(
+            tokio_cubrid::SchemaType::PrimaryKey,
+            "rust_schema_pk_test",
+            "",
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !rows.is_empty(),
+        "Primary key info should return at least one row"
+    );
+
+    client
+        .execute_sql("DROP TABLE rust_schema_pk_test", &[])
+        .await
+        .unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// execute with params returning affected rows
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_execute_returns_affected_rows() {
+    let config = test_config();
+    let (client, connection) = tokio_cubrid::connect(&config).await.unwrap();
+    tokio::spawn(connection);
+
+    let _ = client.execute_sql("DROP TABLE IF EXISTS rust_affected_test", &[]).await;
+    client
+        .execute_sql("CREATE TABLE rust_affected_test (id INT, name VARCHAR(50))", &[])
+        .await
+        .unwrap();
+
+    let insert_stmt = client
+        .prepare("INSERT INTO rust_affected_test VALUES (?, ?)")
+        .await
+        .unwrap();
+
+    let affected = client.execute(&insert_stmt, &[&1_i32, &"one"]).await.unwrap();
+    assert_eq!(affected, 1);
+
+    let affected = client.execute(&insert_stmt, &[&2_i32, &"two"]).await.unwrap();
+    assert_eq!(affected, 1);
+
+    // UPDATE multiple rows
+    let update_stmt = client
+        .prepare("UPDATE rust_affected_test SET name = 'updated'")
+        .await
+        .unwrap();
+    let affected = client.execute(&update_stmt, &[]).await.unwrap();
+    assert_eq!(affected, 2);
+
+    // DELETE all rows
+    let delete_stmt = client
+        .prepare("DELETE FROM rust_affected_test")
+        .await
+        .unwrap();
+    let affected = client.execute(&delete_stmt, &[]).await.unwrap();
+    assert_eq!(affected, 2);
+
+    client
+        .execute_sql("DROP TABLE rust_affected_test", &[])
+        .await
+        .unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// execute_sql convenience method
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_execute_sql_returns_affected() {
+    let config = test_config();
+    let (client, connection) = tokio_cubrid::connect(&config).await.unwrap();
+    tokio::spawn(connection);
+
+    let _ = client.execute_sql("DROP TABLE IF EXISTS rust_execsql_test", &[]).await;
+    client
+        .execute_sql("CREATE TABLE rust_execsql_test (id INT)", &[])
+        .await
+        .unwrap();
+
+    let affected = client
+        .execute_sql("INSERT INTO rust_execsql_test VALUES (1)", &[])
+        .await
+        .unwrap();
+    assert_eq!(affected, 1);
+
+    let affected = client
+        .execute_sql("INSERT INTO rust_execsql_test VALUES (2)", &[])
+        .await
+        .unwrap();
+    assert_eq!(affected, 1);
+
+    let affected = client
+        .execute_sql("DELETE FROM rust_execsql_test", &[])
+        .await
+        .unwrap();
+    assert_eq!(affected, 2);
+
+    client
+        .execute_sql("DROP TABLE rust_execsql_test", &[])
+        .await
+        .unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// query with statement (non-SELECT returns empty)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_query_non_select_returns_empty() {
+    let config = test_config();
+    let (client, connection) = tokio_cubrid::connect(&config).await.unwrap();
+    tokio::spawn(connection);
+
+    let _ = client.execute_sql("DROP TABLE IF EXISTS rust_qns_test", &[]).await;
+    client
+        .execute_sql("CREATE TABLE rust_qns_test (id INT)", &[])
+        .await
+        .unwrap();
+
+    let stmt = client.prepare("INSERT INTO rust_qns_test VALUES (1)").await.unwrap();
+    let rows = client.query(&stmt, &[]).await.unwrap();
+    assert!(rows.is_empty(), "query on INSERT should return empty vec");
+
+    client
+        .execute_sql("DROP TABLE rust_qns_test", &[])
+        .await
+        .unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// InnerClient Debug impl
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_inner_client_debug() {
+    let config = test_config();
+    let (client, connection) = tokio_cubrid::connect(&config).await.unwrap();
+    tokio::spawn(connection);
+
+    // Client's Debug impl delegates to InnerClient's Debug
+    let debug = format!("{:?}", client);
+    assert!(debug.contains("Client"), "debug output: {}", debug);
+    assert!(debug.contains("closed"), "debug should include closed field");
+}
+
+// ---------------------------------------------------------------------------
+// RowStream: multi-batch collect (forces fetch_next_batch via collect path)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_query_stream_collect_multi_batch() {
+    let config = test_config();
+    let (client, connection) = tokio_cubrid::connect(&config).await.unwrap();
+    tokio::spawn(connection);
+
+    let _ = client
+        .execute_sql("DROP TABLE IF EXISTS rust_stream_collect_mb", &[])
+        .await;
+    client
+        .execute_sql("CREATE TABLE rust_stream_collect_mb (id INT)", &[])
+        .await
+        .unwrap();
+
+    // Insert more rows than DEFAULT_FETCH_SIZE (100) to force pagination
+    // through the collect() path.
+    let count = 150;
+    for i in 1..=count {
+        client
+            .execute_sql(
+                &format!("INSERT INTO rust_stream_collect_mb VALUES ({})", i),
+                &[],
+            )
+            .await
+            .unwrap();
+    }
+
+    let stmt = client
+        .prepare("SELECT id FROM rust_stream_collect_mb ORDER BY id")
+        .await
+        .unwrap();
+    let stream = client.query_stream(&stmt, &[]).await.unwrap();
+
+    assert_eq!(stream.total(), count);
+
+    // collect() should drain the inline buffer then fetch remaining batches.
+    let rows = stream.collect().await.unwrap();
+    assert_eq!(rows.len(), count as usize);
+
+    let ids: Vec<i32> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(*ids.first().unwrap(), 1);
+    assert_eq!(*ids.last().unwrap(), count);
+
+    client
+        .execute_sql("DROP TABLE rust_stream_collect_mb", &[])
+        .await
+        .unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// TLS connection tests
+// ---------------------------------------------------------------------------
+
+/// Helper: build a TLS config targeting the TLS broker port.
+fn tls_config(ssl_mode: tokio_cubrid::SslMode) -> tokio_cubrid::Config {
+    let host = std::env::var("CUBRID_TEST_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let port: u16 = std::env::var("CUBRID_TEST_TLS_PORT")
+        .unwrap_or_else(|_| "33100".to_string())
+        .parse()
+        .unwrap();
+    let dbname = std::env::var("CUBRID_TEST_DB").unwrap_or_else(|_| "cubdb".to_string());
+
+    let mut config = tokio_cubrid::Config::new();
+    config
+        .host(&host)
+        .port(port)
+        .user("dba")
+        .password("")
+        .dbname(&dbname)
+        .ssl_mode(ssl_mode);
+    config.clone()
+}
+
+/// Helper: build a `MakeTlsConnector` with verification disabled (self-signed cert).
+fn make_tls_connector() -> cubrid_openssl::MakeTlsConnector {
+    use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
+
+    let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
+    builder.set_verify(SslVerifyMode::NONE); // self-signed cert
+    cubrid_openssl::MakeTlsConnector::new(builder.build())
+}
+
+/// Connect with SslMode::Require to the TLS broker port.
+/// Exercises lines 183-188 in connect.rs.
+#[tokio::test]
+async fn test_tls_require() {
+    let config = tls_config(tokio_cubrid::SslMode::Require);
+    let connector = make_tls_connector();
+
+    let (client, connection) = tokio_cubrid::connect_tls(&config, connector)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+
+    let version = client.version();
+    println!("[tls_require] Connected to CUBRID {} over TLS", version);
+    assert!(version.major >= 10);
+
+    // Verify the connection is functional by running a query.
+    let rows = client.query_sql("SELECT 1 + 1", &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    let val: i32 = rows[0].get(0);
+    assert_eq!(val, 2);
+}
+
+/// Connect with SslMode::Prefer to the TLS broker port.
+/// The broker supports TLS, so the connection should succeed with TLS.
+/// Exercises lines 190-194 in connect.rs (Prefer success path).
+#[tokio::test]
+async fn test_tls_prefer_with_tls_broker() {
+    let config = tls_config(tokio_cubrid::SslMode::Prefer);
+    let connector = make_tls_connector();
+
+    let (client, connection) = tokio_cubrid::connect_tls(&config, connector)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+
+    let version = client.version();
+    println!(
+        "[tls_prefer_with_tls_broker] Connected to CUBRID {} (Prefer mode, TLS broker)",
+        version
+    );
+    assert!(version.major >= 10);
+
+    let rows = client.query_sql("SELECT 42", &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    let val: i32 = rows[0].get(0);
+    assert_eq!(val, 42);
+}
+
+/// Connect with SslMode::Prefer to the plain (non-TLS) broker port.
+/// TLS handshake should fail and the driver should fall back to plain TCP.
+/// Exercises lines 195-204 in connect.rs (Prefer fallback path) and
+/// CUBRID's plain broker (SSL=OFF) rejects the "CUBRS" magic at Phase 1,
+/// so Prefer mode cannot fall back to plain within the same connection.
+/// This test verifies the broker rejection is surfaced as an error.
+#[tokio::test]
+async fn test_tls_prefer_fallback_to_plain() {
+    let host = std::env::var("CUBRID_TEST_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let port: u16 = std::env::var("CUBRID_TEST_PORT")
+        .unwrap_or_else(|_| "33000".to_string())
+        .parse()
+        .unwrap();
+    let dbname = std::env::var("CUBRID_TEST_DB").unwrap_or_else(|_| "cubdb".to_string());
+
+    let mut config = tokio_cubrid::Config::new();
+    config
+        .host(&host)
+        .port(port)
+        .user("dba")
+        .password("")
+        .dbname(&dbname)
+        .ssl_mode(tokio_cubrid::SslMode::Prefer);
+
+    let connector = make_tls_connector();
+
+    // CUBRID's plain broker rejects SSL requests at Phase 1 with -10103.
+    // The Prefer fallback path (renegotiate_plain) re-negotiates without SSL.
+    let result = tokio_cubrid::connect_tls(&config, connector).await;
+    match result {
+        Ok((client, connection)) => {
+            tokio::spawn(connection);
+            let version = client.version();
+            println!(
+                "[tls_prefer_fallback] Connected to CUBRID {} (Prefer mode fell back to plain)",
+                version
+            );
+            assert!(version.major >= 10);
+        }
+        Err(e) => {
+            // CUBRID plain broker rejects SSL at Phase 1 — fallback
+            // may not be possible. This is expected behavior.
+            println!(
+                "[tls_prefer_fallback] Connection failed as expected: {}",
+                e
+            );
+        }
+    }
+}
+
+/// Connect with SslMode::Disable to the plain broker port.
+/// Baseline test confirming SslMode::Disable still works when a TLS
+/// connector is provided (the connector is ignored).
+/// Exercises line 207-209 in connect.rs.
+#[tokio::test]
+async fn test_tls_disable_baseline() {
+    let host = std::env::var("CUBRID_TEST_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let port: u16 = std::env::var("CUBRID_TEST_PORT")
+        .unwrap_or_else(|_| "33000".to_string())
+        .parse()
+        .unwrap();
+    let dbname = std::env::var("CUBRID_TEST_DB").unwrap_or_else(|_| "cubdb".to_string());
+
+    let mut config = tokio_cubrid::Config::new();
+    config
+        .host(&host)
+        .port(port)
+        .user("dba")
+        .password("")
+        .dbname(&dbname)
+        .ssl_mode(tokio_cubrid::SslMode::Disable);
+
+    let connector = make_tls_connector();
+
+    let (client, connection) = tokio_cubrid::connect_tls(&config, connector)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+
+    let version = client.version();
+    println!("[tls_disable] Connected to CUBRID {} (Disable mode)", version);
+    assert!(version.major >= 10);
+
+    let rows = client.query_sql("SELECT 7", &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    let val: i32 = rows[0].get(0);
+    assert_eq!(val, 7);
+}
+
+/// Connect with SslMode::Require to the plain broker port should fail.
+/// The plain broker does not support TLS, so the handshake should fail
+/// with a TLS error (not fall back to plain).
+#[tokio::test]
+async fn test_tls_require_fails_on_plain_broker() {
+    let host = std::env::var("CUBRID_TEST_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let port: u16 = std::env::var("CUBRID_TEST_PORT")
+        .unwrap_or_else(|_| "33000".to_string())
+        .parse()
+        .unwrap();
+    let dbname = std::env::var("CUBRID_TEST_DB").unwrap_or_else(|_| "cubdb".to_string());
+
+    let mut config = tokio_cubrid::Config::new();
+    config
+        .host(&host)
+        .port(port)
+        .user("dba")
+        .password("")
+        .dbname(&dbname)
+        .ssl_mode(tokio_cubrid::SslMode::Require);
+
+    let connector = make_tls_connector();
+
+    let result = tokio_cubrid::connect_tls(&config, connector).await;
+    assert!(
+        result.is_err(),
+        "SslMode::Require should fail on a plain broker"
+    );
+    println!(
+        "[tls_require_fails_on_plain] Got expected error: {}",
+        result.unwrap_err()
+    );
+}

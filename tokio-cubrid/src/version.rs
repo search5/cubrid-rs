@@ -391,4 +391,16 @@ mod tests {
         assert!(!d.supports_cte);
         assert!(d.supports_merge);
     }
+
+    #[test]
+    fn test_parse_invalid_patch() {
+        let err = CubridVersion::parse("11.4.abc.0").unwrap_err();
+        assert!(err.to_string().contains("patch version"));
+    }
+
+    #[test]
+    fn test_parse_invalid_build() {
+        let err = CubridVersion::parse("11.4.0.xyz").unwrap_err();
+        assert!(err.to_string().contains("build number"));
+    }
 }

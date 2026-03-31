@@ -628,4 +628,16 @@ mod tests {
         let n = CubridNumeric::new("NaN");
         assert_eq!(n.as_str(), "NaN");
     }
+
+    #[test]
+    fn test_minus_only_is_invalid() {
+        assert!(!CubridNumeric::new("-").is_valid());
+    }
+
+    #[test]
+    fn test_into_string() {
+        let n = CubridNumeric::new("42.5");
+        let s: String = n.into_string();
+        assert_eq!(s, "42.5");
+    }
 }

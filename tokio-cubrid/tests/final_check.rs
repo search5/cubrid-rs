@@ -4,13 +4,14 @@ use cubrid_types::*;
 use tokio_cubrid::{Config, connect};
 
 fn test_config() -> Config {
+    let host = std::env::var("CUBRID_TEST_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let port: u16 = std::env::var("CUBRID_TEST_PORT")
+        .unwrap_or_else(|_| "33000".to_string())
+        .parse()
+        .unwrap();
+    let dbname = std::env::var("CUBRID_TEST_DB").unwrap_or_else(|_| "testdb".to_string());
     let mut config = Config::new();
-    config
-        .host("localhost")
-        .port(std::env::var("CUBRID_TEST_PORT").unwrap_or_else(|_| "33000".to_string()).parse().unwrap())
-        .user("dba")
-        .password("")
-        .dbname("testdb");
+    config.host(&host).port(port).user("dba").password("").dbname(&dbname);
     config.clone()
 }
 

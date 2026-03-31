@@ -353,4 +353,25 @@ mod tests {
         assert_eq!(buf.len(), 8);
         assert_eq!(&buf[..8], &1.0_f64.to_be_bytes());
     }
+
+    #[test]
+    fn test_currency_display() {
+        assert_eq!(format!("{}", Currency::Dollar), "Dollar");
+        assert_eq!(format!("{}", Currency::Won), "Won");
+    }
+
+    #[test]
+    fn test_monetary_from_sql_too_short() {
+        let result = CubridMonetary::from_sql(&Type::MONETARY, &[0u8; 7]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("8 bytes"));
+    }
+
+    #[test]
+    fn test_monetary_from_sql_round_trip() {
+        let val = CubridMonetary::new(99.99, Currency::Yen);
+        let buf = to_bytes(&val, &Type::MONETARY);
+        let restored = CubridMonetary::from_sql(&Type::MONETARY, &buf).unwrap();
+        assert!((restored.amount - 99.99).abs() < 1e-10);
+    }
 }

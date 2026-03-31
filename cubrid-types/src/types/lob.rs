@@ -298,4 +298,43 @@ mod tests {
         let restored = CubridLobHandle::from_sql(&Type::BLOB, &buf).unwrap();
         assert_eq!(restored.locator, locator);
     }
+
+    // -- FromSql error paths --
+
+    #[test]
+    fn test_lob_from_sql_too_short() {
+        let result = CubridLobHandle::from_sql(&Type::BLOB, &[0u8; 16]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("17 bytes"));
+    }
+
+    #[test]
+    fn test_lob_from_sql_negative_locator_size() {
+        let mut buf = vec![0u8; 17];
+        // db_type = BLOB (23)
+        buf[0..4].copy_from_slice(&23i32.to_be_bytes());
+        // lobSize = 0
+        buf[4..12].copy_from_slice(&0i64.to_be_bytes());
+        // locatorSize = -1 (negative)
+        buf[12..16].copy_from_slice(&(-1i32).to_be_bytes());
+        buf[16] = 0; // null terminator
+        let result = CubridLobHandle::from_sql(&Type::BLOB, &buf);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("negative"));
+    }
+
+    #[test]
+    fn test_lob_from_sql_truncated_locator() {
+        let mut buf = vec![0u8; 17];
+        // db_type = BLOB (23)
+        buf[0..4].copy_from_slice(&23i32.to_be_bytes());
+        // lobSize = 0
+        buf[4..12].copy_from_slice(&0i64.to_be_bytes());
+        // locatorSize = 100 (but only 1 byte available)
+        buf[12..16].copy_from_slice(&100i32.to_be_bytes());
+        buf[16] = 0;
+        let result = CubridLobHandle::from_sql(&Type::BLOB, &buf);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated"));
+    }
 }

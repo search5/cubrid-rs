@@ -1436,7 +1436,7 @@ mod tests {
     #[cfg(feature = "with-chrono")]
     mod chrono_tests {
         use super::*;
-        use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+        use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 
         // -- NaiveDate <-> CubridDate --
 
@@ -1637,6 +1637,241 @@ mod tests {
                 .unwrap();
             let cdt: CubridDateTime = ndt.into();
             assert_eq!(cdt.millisecond, 500); // microseconds truncated
+        }
+
+        // -- NaiveDate::from_sql error paths --
+
+        #[test]
+        fn test_chrono_naive_date_from_sql_insufficient_bytes() {
+            // Less than 6 bytes should error
+            let result = NaiveDate::from_sql(&Type::DATE, &[0u8; 5]);
+            assert!(result.is_err());
+            let msg = result.unwrap_err().to_string();
+            assert!(msg.contains("expected 6 bytes"), "got: {}", msg);
+
+            let result = NaiveDate::from_sql(&Type::DATE, &[]);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_chrono_naive_date_from_sql_invalid_month() {
+            // month=13 is invalid for chrono
+            let mut buf = BytesMut::new();
+            short_to_sql(2026, &mut buf); // year
+            short_to_sql(13, &mut buf);   // month (invalid)
+            short_to_sql(1, &mut buf);    // day
+            let result = NaiveDate::from_sql(&Type::DATE, &buf);
+            assert!(result.is_err());
+            let msg = result.unwrap_err().to_string();
+            assert!(msg.contains("invalid date"), "got: {}", msg);
+        }
+
+        #[test]
+        fn test_chrono_naive_date_from_sql_invalid_day() {
+            // day=0 is invalid
+            let mut buf = BytesMut::new();
+            short_to_sql(2026, &mut buf);
+            short_to_sql(1, &mut buf);
+            short_to_sql(0, &mut buf); // day=0 invalid
+            let result = NaiveDate::from_sql(&Type::DATE, &buf);
+            assert!(result.is_err());
+        }
+
+        // -- NaiveTime::from_sql error paths --
+
+        #[test]
+        fn test_chrono_naive_time_from_sql_insufficient_bytes() {
+            let result = NaiveTime::from_sql(&Type::TIME, &[0u8; 5]);
+            assert!(result.is_err());
+            let msg = result.unwrap_err().to_string();
+            assert!(msg.contains("expected 6 bytes"), "got: {}", msg);
+
+            let result = NaiveTime::from_sql(&Type::TIME, &[]);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_chrono_naive_time_from_sql_invalid_hour() {
+            // hour=25 is invalid
+            let mut buf = BytesMut::new();
+            short_to_sql(25, &mut buf); // hour (invalid)
+            short_to_sql(0, &mut buf);  // min
+            short_to_sql(0, &mut buf);  // sec
+            let result = NaiveTime::from_sql(&Type::TIME, &buf);
+            assert!(result.is_err());
+            let msg = result.unwrap_err().to_string();
+            assert!(msg.contains("invalid time"), "got: {}", msg);
+        }
+
+        #[test]
+        fn test_chrono_naive_time_from_sql_invalid_minute() {
+            // minute=60 is invalid
+            let mut buf = BytesMut::new();
+            short_to_sql(12, &mut buf);
+            short_to_sql(60, &mut buf); // minute (invalid)
+            short_to_sql(0, &mut buf);
+            let result = NaiveTime::from_sql(&Type::TIME, &buf);
+            assert!(result.is_err());
+        }
+
+        // -- NaiveDateTime::from_sql error paths --
+
+        #[test]
+        fn test_chrono_naive_datetime_from_sql_timestamp_insufficient_bytes() {
+            // Timestamp requires 12 bytes
+            let result = NaiveDateTime::from_sql(&Type::TIMESTAMP, &[0u8; 11]);
+            assert!(result.is_err());
+            let msg = result.unwrap_err().to_string();
+            assert!(msg.contains("expected at least 12 bytes"), "got: {}", msg);
+
+            let result = NaiveDateTime::from_sql(&Type::TIMESTAMP, &[]);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_chrono_naive_datetime_from_sql_datetime_insufficient_bytes() {
+            // DateTime requires 14 bytes
+            let result = NaiveDateTime::from_sql(&Type::DATETIME, &[0u8; 13]);
+            assert!(result.is_err());
+            let msg = result.unwrap_err().to_string();
+            assert!(msg.contains("expected at least 14 bytes"), "got: {}", msg);
+
+            // 12 bytes is enough for Timestamp but not DateTime
+            let result = NaiveDateTime::from_sql(&Type::DATETIME, &[0u8; 12]);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_chrono_naive_datetime_from_sql_timestamp_invalid_date() {
+            // Valid length (12 bytes) but month=13
+            let mut buf = BytesMut::new();
+            short_to_sql(2026, &mut buf); // year
+            short_to_sql(13, &mut buf);   // month (invalid)
+            short_to_sql(1, &mut buf);    // day
+            short_to_sql(0, &mut buf);    // hour
+            short_to_sql(0, &mut buf);    // min
+            short_to_sql(0, &mut buf);    // sec
+            let result = NaiveDateTime::from_sql(&Type::TIMESTAMP, &buf);
+            assert!(result.is_err());
+            let msg = result.unwrap_err().to_string();
+            assert!(msg.contains("invalid date"), "got: {}", msg);
+        }
+
+        #[test]
+        fn test_chrono_naive_datetime_from_sql_datetime_invalid_time() {
+            // Valid length (14 bytes) but hour=25
+            let mut buf = BytesMut::new();
+            short_to_sql(2026, &mut buf); // year
+            short_to_sql(1, &mut buf);    // month
+            short_to_sql(1, &mut buf);    // day
+            short_to_sql(25, &mut buf);   // hour (invalid)
+            short_to_sql(0, &mut buf);    // min
+            short_to_sql(0, &mut buf);    // sec
+            short_to_sql(0, &mut buf);    // millis
+            let result = NaiveDateTime::from_sql(&Type::DATETIME, &buf);
+            assert!(result.is_err());
+            let msg = result.unwrap_err().to_string();
+            assert!(msg.contains("invalid time"), "got: {}", msg);
+        }
+
+        // -- CubridDate -> NaiveDate TryFrom error paths --
+
+        #[test]
+        fn test_cubrid_date_to_naive_date_invalid_month_zero() {
+            let cd = CubridDate::new(2026, 0, 15);
+            let result: Result<NaiveDate, _> = cd.try_into();
+            assert!(result.is_err());
+            let msg = result.unwrap_err().to_string();
+            assert!(msg.contains("invalid date"), "got: {}", msg);
+        }
+
+        #[test]
+        fn test_cubrid_date_to_naive_date_invalid_day() {
+            let cd = CubridDate::new(2026, 1, 32);
+            let result: Result<NaiveDate, _> = cd.try_into();
+            assert!(result.is_err());
+            let msg = result.unwrap_err().to_string();
+            assert!(msg.contains("invalid date"), "got: {}", msg);
+        }
+
+        // -- CubridTime -> NaiveTime TryFrom error path --
+
+        #[test]
+        fn test_cubrid_time_to_naive_time_invalid_hour() {
+            let ct = CubridTime::new(25, 0, 0);
+            let result: Result<NaiveTime, _> = ct.try_into();
+            assert!(result.is_err());
+            let msg = result.unwrap_err().to_string();
+            assert!(msg.contains("invalid time"), "got: {}", msg);
+        }
+
+        // -- CubridDateTime -> NaiveDateTime TryFrom error paths --
+
+        #[test]
+        fn test_cubrid_datetime_to_naive_datetime_invalid_date() {
+            let cdt = CubridDateTime::new(2026, 13, 1, 0, 0, 0, 0);
+            let result: Result<NaiveDateTime, _> = cdt.try_into();
+            assert!(result.is_err());
+            let msg = result.unwrap_err().to_string();
+            assert!(msg.contains("invalid date"), "got: {}", msg);
+        }
+
+        #[test]
+        fn test_cubrid_datetime_to_naive_datetime_invalid_time() {
+            let cdt = CubridDateTime::new(2026, 1, 1, 25, 0, 0, 0);
+            let result: Result<NaiveDateTime, _> = cdt.try_into();
+            assert!(result.is_err());
+            let msg = result.unwrap_err().to_string();
+            assert!(msg.contains("invalid time"), "got: {}", msg);
+        }
+
+        // -- NaiveDateTime -> CubridTimestamp From impl --
+
+        #[test]
+        fn test_naive_datetime_to_cubrid_timestamp() {
+            let ndt = NaiveDate::from_ymd_opt(2026, 6, 15)
+                .unwrap()
+                .and_hms_opt(14, 30, 59)
+                .unwrap();
+            let cts: CubridTimestamp = ndt.into();
+            assert_eq!(cts.year, 2026);
+            assert_eq!(cts.month, 6);
+            assert_eq!(cts.day, 15);
+            assert_eq!(cts.hour, 14);
+            assert_eq!(cts.minute, 30);
+            assert_eq!(cts.second, 59);
+        }
+
+        // -- CubridTimestamp -> NaiveDateTime TryFrom --
+
+        #[test]
+        fn test_cubrid_timestamp_to_naive_datetime_valid() {
+            let cts = CubridTimestamp::new(2026, 6, 15, 14, 30, 59);
+            let ndt: NaiveDateTime = cts.try_into().unwrap();
+            assert_eq!(ndt.year(), 2026);
+            assert_eq!(ndt.month(), 6);
+            assert_eq!(ndt.day(), 15);
+            assert_eq!(ndt.hour(), 14);
+            assert_eq!(ndt.minute(), 30);
+            assert_eq!(ndt.second(), 59);
+        }
+
+        #[test]
+        fn test_cubrid_timestamp_to_naive_datetime_invalid_date() {
+            let cts = CubridTimestamp::new(2026, 0, 1, 0, 0, 0);
+            let result: Result<NaiveDateTime, _> = cts.try_into();
+            assert!(result.is_err());
+            let msg = result.unwrap_err().to_string();
+            assert!(msg.contains("invalid date"), "got: {}", msg);
+        }
+
+        #[test]
+        fn test_cubrid_timestamp_to_naive_datetime_invalid_time() {
+            let cts = CubridTimestamp::new(2026, 1, 1, 25, 0, 0);
+            let result: Result<NaiveDateTime, _> = cts.try_into();
+            assert!(result.is_err());
+            let msg = result.unwrap_err().to_string();
+            assert!(msg.contains("invalid time"), "got: {}", msg);
         }
     }
 

@@ -32,7 +32,7 @@ use cubrid_protocol::message::frontend;
 use cubrid_protocol::{DRIVER_SESSION_SIZE, NET_SIZE_CAS_INFO, NET_SIZE_INT};
 
 use crate::config::Config;
-use crate::connection::{Connection, Request};
+use crate::connection::{Connection, ReconnectInfo, Request};
 use crate::error::Error;
 use crate::tls::{MakeTlsConnect, MaybeTlsStream, SslMode, TlsConnect};
 use crate::version::{CubridDialect, CubridVersion};
@@ -279,15 +279,29 @@ where
     }
 
     // Phase 3: Version detection (inline, before wrapping in Framed)
+    // Always send autocommit=false for version detection to prevent CAS
+    // from closing the TCP socket under KEEP_CONNECTION=AUTO mode.
+    // The actual autocommit state is set in CasInfo after connection.
     let (version, cas_info) =
-        detect_version(&mut stream, &cas_info, config.get_auto_commit()).await?;
+        detect_version(&mut stream, &cas_info, false).await?;
     let dialect = CubridDialect::from_version(&version);
 
     // Wrap the stream in a Framed codec for subsequent request/response
     let framed = Framed::new(stream, CubridCodec::new());
 
+    // Store connection parameters for CAS reconnection under
+    // KEEP_CONNECTION=AUTO mode.
+    let reconnect_info = ReconnectInfo {
+        host: config.get_hosts().first().map(|s| s.as_str()).unwrap_or("localhost").to_string(),
+        port: config.get_port(),
+        dbname: config.get_dbname().to_string(),
+        user: config.get_user().to_string(),
+        password: config.get_password().to_string(),
+        protocol_version: protocol_version,
+    };
+
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let connection = Connection::new(framed, rx, cas_info);
+    let connection = Connection::new(framed, rx, cas_info, reconnect_info);
 
     Ok(ConnectResult {
         cas_info,

@@ -43,6 +43,9 @@ pub struct Client {
     /// Wrapped in Option so Drop can take ownership to close the channel
     /// before shutting down the runtime.
     client: Option<tokio_cubrid::Client>,
+    /// Handle to the background connection task, used to ensure graceful
+    /// shutdown (CON_CLOSE) during Drop.
+    connection_handle: Option<tokio::task::JoinHandle<Result<(), Error>>>,
 }
 
 impl Client {
@@ -79,15 +82,16 @@ impl Client {
     {
         let runtime = Runtime::new().map_err(Error::Io)?;
 
-        let client = runtime.block_on(async {
+        let (client, handle) = runtime.block_on(async {
             let (client, connection) = tokio_cubrid::connect_tls(config, tls).await?;
-            tokio::spawn(connection);
-            Ok::<_, Error>(client)
+            let handle = tokio::spawn(connection);
+            Ok::<_, Error>((client, handle))
         })?;
 
         Ok(Client {
             runtime,
             client: Some(client),
+            connection_handle: Some(handle),
         })
     }
 
@@ -291,9 +295,17 @@ impl Drop for Client {
     fn drop(&mut self) {
         // Drop the async client first to close the channel sender.
         // This causes the Connection task's recv loop to exit, sending
-        // CON_CLOSE before the task completes. Then Runtime::drop()
-        // can join the task without hanging indefinitely.
+        // CON_CLOSE before the task completes.
         drop(self.client.take());
+
+        // Wait for the connection task to finish so that CON_CLOSE is
+        // actually sent to the server before the runtime shuts down.
+        // Without this, the runtime cancels spawned tasks on drop,
+        // and the server never receives the disconnect — leading to
+        // stale CAS processes that can exhaust the broker pool.
+        if let Some(handle) = self.connection_handle.take() {
+            let _ = self.runtime.block_on(handle);
+        }
     }
 }
 

@@ -42,7 +42,21 @@ impl FromSql<sql_types::Date, Cubrid> for String {
 
 impl ToSql<sql_types::Date, Cubrid> for String {
     fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Cubrid>) -> serialize::Result {
-        // Write as string representation; the server can parse it.
+        // Parse "YYYY-MM-DD" and write as 3 x i16 big-endian (wire format).
+        let parts: Vec<&str> = self.split('-').collect();
+        if parts.len() == 3 {
+            if let (Ok(y), Ok(m), Ok(d)) = (
+                parts[0].parse::<i16>(),
+                parts[1].parse::<i16>(),
+                parts[2].parse::<i16>(),
+            ) {
+                out.write_all(&y.to_be_bytes())?;
+                out.write_all(&m.to_be_bytes())?;
+                out.write_all(&d.to_be_bytes())?;
+                return Ok(IsNull::No);
+            }
+        }
+        // Fallback: write as raw string bytes.
         out.write_all(self.as_bytes())
             .map(|_| IsNull::No)
             .map_err(Into::into)
@@ -66,6 +80,8 @@ impl FromSql<sql_types::Time, Cubrid> for String {
 
 impl ToSql<sql_types::Time, Cubrid> for String {
     fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Cubrid>) -> serialize::Result {
+        // Write as string representation. The bind parameter is sent with
+        // STRING wire type, so the server parses the "HH:MM:SS" text.
         out.write_all(self.as_bytes())
             .map(|_| IsNull::No)
             .map_err(Into::into)
@@ -95,6 +111,31 @@ impl FromSql<sql_types::Timestamp, Cubrid> for String {
 
 impl ToSql<sql_types::Timestamp, Cubrid> for String {
     fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Cubrid>) -> serialize::Result {
+        // Parse "YYYY-MM-DD HH:MM:SS" and write as 6 x i16 big-endian (wire format).
+        let datetime_parts: Vec<&str> = self.splitn(2, ' ').collect();
+        if datetime_parts.len() == 2 {
+            let date_parts: Vec<&str> = datetime_parts[0].split('-').collect();
+            let time_parts: Vec<&str> = datetime_parts[1].split(':').collect();
+            if date_parts.len() == 3 && time_parts.len() == 3 {
+                if let (Ok(y), Ok(mo), Ok(d), Ok(h), Ok(mi), Ok(s)) = (
+                    date_parts[0].parse::<i16>(),
+                    date_parts[1].parse::<i16>(),
+                    date_parts[2].parse::<i16>(),
+                    time_parts[0].parse::<i16>(),
+                    time_parts[1].parse::<i16>(),
+                    time_parts[2].parse::<i16>(),
+                ) {
+                    out.write_all(&y.to_be_bytes())?;
+                    out.write_all(&mo.to_be_bytes())?;
+                    out.write_all(&d.to_be_bytes())?;
+                    out.write_all(&h.to_be_bytes())?;
+                    out.write_all(&mi.to_be_bytes())?;
+                    out.write_all(&s.to_be_bytes())?;
+                    return Ok(IsNull::No);
+                }
+            }
+        }
+        // Fallback: write as raw string bytes.
         out.write_all(self.as_bytes())
             .map(|_| IsNull::No)
             .map_err(Into::into)

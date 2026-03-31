@@ -1892,4 +1892,732 @@ mod tests {
         assert_eq!(result.tuple_count, 0);
         assert!(result.tuples.is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // parse_error: legacy format edge cases (lines 141-154)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_error_legacy_empty_payload() {
+        // Legacy format (response_code not -1 or -2), payload too short for
+        // the indicator field. Should return Cas error with response_code.
+        let data = build_frame([0, 0, 0, 0], -99, &[]);
+        let frame = ResponseFrame::parse(data).unwrap();
+        let err = frame.parse_error();
+
+        match err {
+            Error::Cas { code, message } => {
+                assert_eq!(code, -99);
+                assert!(message.is_empty());
+            }
+            other => panic!("expected Cas error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_error_legacy_truncated_before_error_code() {
+        // Legacy format: payload has the indicator (4 bytes) but not enough
+        // bytes for the error_code. Should fall back to response_code.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(-1_i32).to_be_bytes()); // indicator (CAS)
+        // No error_code bytes follow
+
+        let data = build_frame([0, 0, 0, 0], -99, &payload);
+        let frame = ResponseFrame::parse(data).unwrap();
+        let err = frame.parse_error();
+
+        match err {
+            Error::Cas { code, message } => {
+                assert_eq!(code, -99); // falls back to response_code
+                assert!(message.is_empty());
+            }
+            other => panic!("expected Cas error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_error_legacy_truncated_partial_payload() {
+        // Legacy format: payload has indicator (4 bytes) + only 2 bytes
+        // (not enough for error_code). Falls back to response_code for
+        // the error code, and the 2 leftover bytes are read as message.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(-2_i32).to_be_bytes()); // indicator (DBMS)
+        payload.extend_from_slice(&[0xFF, 0xFF]); // incomplete error_code
+
+        let data = build_frame([0, 0, 0, 0], -50, &payload);
+        let frame = ResponseFrame::parse(data).unwrap();
+        let err = frame.parse_error();
+
+        match err {
+            Error::Dbms { code, .. } => {
+                assert_eq!(code, -50); // falls back to response_code
+            }
+            other => panic!("expected Dbms error, got {:?}", other),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_column_metadata: truncated payloads (lines 296-367)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_column_metadata_truncated_at_type_byte() {
+        // Empty cursor when column_count > 0 triggers "truncated column metadata"
+        let data: Vec<u8> = vec![];
+        let mut cursor = &data[..];
+        let result = parse_column_metadata(&mut cursor, 1, crate::PROTOCOL_V12);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated column metadata"));
+    }
+
+    #[test]
+    fn test_parse_column_metadata_truncated_collection_element_type() {
+        // V7+: type byte with 0x80 set but no element type byte following
+        let data: Vec<u8> = vec![0xA0]; // collection flag + SET, but no element byte
+        let mut cursor = &data[..];
+        let result = parse_column_metadata(&mut cursor, 1, crate::PROTOCOL_V7);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated collection element type"));
+    }
+
+    #[test]
+    fn test_parse_column_metadata_truncated_scale() {
+        // Type byte present but no scale bytes
+        let data: Vec<u8> = vec![8]; // INT type, then nothing
+        let mut cursor = &data[..];
+        let result = parse_column_metadata(&mut cursor, 1, crate::PROTOCOL_V12);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated scale"));
+    }
+
+    #[test]
+    fn test_parse_column_metadata_truncated_precision() {
+        // Type byte + scale present but no precision bytes
+        let mut data = Vec::new();
+        data.push(8); // INT type
+        data.extend_from_slice(&0_i16.to_be_bytes()); // scale
+        // No precision bytes
+        let mut cursor = &data[..];
+        let result = parse_column_metadata(&mut cursor, 1, crate::PROTOCOL_V12);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated precision"));
+    }
+
+    #[test]
+    fn test_parse_column_metadata_truncated_nullable_flag() {
+        // type + scale + precision + 3 strings, but no nullable byte
+        let mut data = Vec::new();
+        data.push(8); // INT
+        data.extend_from_slice(&0_i16.to_be_bytes()); // scale
+        data.extend_from_slice(&0_i32.to_be_bytes()); // precision
+        // name
+        data.extend_from_slice(&2_i32.to_be_bytes());
+        data.extend_from_slice(b"a\0");
+        // real_name
+        data.extend_from_slice(&2_i32.to_be_bytes());
+        data.extend_from_slice(b"a\0");
+        // table_name
+        data.extend_from_slice(&2_i32.to_be_bytes());
+        data.extend_from_slice(b"t\0");
+        // No nullable flag
+        let mut cursor = &data[..];
+        let result = parse_column_metadata(&mut cursor, 1, crate::PROTOCOL_V12);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated nullable flag"));
+    }
+
+    #[test]
+    fn test_parse_column_metadata_truncated_column_flags() {
+        // type + scale + precision + 3 strings + nullable + default_value,
+        // but missing the 7 boolean flag bytes
+        let mut data = Vec::new();
+        data.push(8); // INT
+        data.extend_from_slice(&0_i16.to_be_bytes()); // scale
+        data.extend_from_slice(&0_i32.to_be_bytes()); // precision
+        // name
+        data.extend_from_slice(&2_i32.to_be_bytes());
+        data.extend_from_slice(b"a\0");
+        // real_name
+        data.extend_from_slice(&2_i32.to_be_bytes());
+        data.extend_from_slice(b"a\0");
+        // table_name
+        data.extend_from_slice(&2_i32.to_be_bytes());
+        data.extend_from_slice(b"t\0");
+        // nullable
+        data.push(1);
+        // default_value (empty)
+        data.extend_from_slice(&0_i32.to_be_bytes());
+        // Only 3 of the required 7 flag bytes
+        data.extend_from_slice(&[0, 0, 0]);
+        let mut cursor = &data[..];
+        let result = parse_column_metadata(&mut cursor, 1, crate::PROTOCOL_V12);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated column flags"));
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_schema_column_metadata: truncated payloads (lines 412-454)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_schema_column_metadata_negative_count() {
+        let data: Vec<u8> = vec![];
+        let mut cursor = &data[..];
+        let result = parse_schema_column_metadata(&mut cursor, -1, crate::PROTOCOL_V12);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("negative column count"));
+    }
+
+    #[test]
+    fn test_parse_schema_column_metadata_truncated_at_type_byte() {
+        let data: Vec<u8> = vec![];
+        let mut cursor = &data[..];
+        let result = parse_schema_column_metadata(&mut cursor, 1, crate::PROTOCOL_V12);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated schema column metadata"));
+    }
+
+    #[test]
+    fn test_parse_schema_column_metadata_truncated_collection_element() {
+        // V7+: type byte with 0x80 set but no element type byte
+        let data: Vec<u8> = vec![0xA0];
+        let mut cursor = &data[..];
+        let result = parse_schema_column_metadata(&mut cursor, 1, crate::PROTOCOL_V7);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated collection element type"));
+    }
+
+    #[test]
+    fn test_parse_schema_column_metadata_truncated_scale() {
+        // Type byte present but no scale
+        let data: Vec<u8> = vec![8]; // INT
+        let mut cursor = &data[..];
+        let result = parse_schema_column_metadata(&mut cursor, 1, crate::PROTOCOL_V12);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated scale"));
+    }
+
+    #[test]
+    fn test_parse_schema_column_metadata_truncated_precision() {
+        let mut data = Vec::new();
+        data.push(8); // INT
+        data.extend_from_slice(&0_i16.to_be_bytes()); // scale
+        // No precision
+        let mut cursor = &data[..];
+        let result = parse_schema_column_metadata(&mut cursor, 1, crate::PROTOCOL_V12);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated precision"));
+    }
+
+    #[test]
+    fn test_parse_schema_column_metadata_collection_set() {
+        // V7+: SET of INT — collection_code 0x20
+        let mut data = Vec::new();
+        data.push(0xA0); // 0x80 | 0x20 (SET)
+        data.push(8);    // element: INT
+        data.extend_from_slice(&0_i16.to_be_bytes()); // scale
+        data.extend_from_slice(&0_i32.to_be_bytes()); // precision
+        data.extend_from_slice(&2_i32.to_be_bytes()); // name len
+        data.extend_from_slice(b"s\0");
+        let mut cursor = &data[..];
+        let result = parse_schema_column_metadata(&mut cursor, 1, crate::PROTOCOL_V7).unwrap();
+        assert_eq!(result[0].column_type, CubridDataType::Set);
+        assert_eq!(result[0].collection_element_type, Some(CubridDataType::Int));
+    }
+
+    #[test]
+    fn test_parse_schema_column_metadata_collection_multiset() {
+        // V7+: MULTISET of String — collection_code 0x40
+        let mut data = Vec::new();
+        data.push(0xC0); // 0x80 | 0x40 (MULTISET)
+        data.push(2);    // element: String
+        data.extend_from_slice(&0_i16.to_be_bytes());
+        data.extend_from_slice(&0_i32.to_be_bytes());
+        data.extend_from_slice(&2_i32.to_be_bytes());
+        data.extend_from_slice(b"m\0");
+        let mut cursor = &data[..];
+        let result = parse_schema_column_metadata(&mut cursor, 1, crate::PROTOCOL_V7).unwrap();
+        assert_eq!(result[0].column_type, CubridDataType::MultiSet);
+        assert_eq!(result[0].collection_element_type, Some(CubridDataType::String));
+    }
+
+    #[test]
+    fn test_parse_schema_column_metadata_collection_sequence() {
+        // V7+: SEQUENCE of Double — collection_code 0x60
+        let mut data = Vec::new();
+        data.push(0xE0); // 0x80 | 0x60 (SEQUENCE)
+        data.push(12);   // element: Double
+        data.extend_from_slice(&0_i16.to_be_bytes());
+        data.extend_from_slice(&0_i32.to_be_bytes());
+        data.extend_from_slice(&2_i32.to_be_bytes());
+        data.extend_from_slice(b"q\0");
+        let mut cursor = &data[..];
+        let result = parse_schema_column_metadata(&mut cursor, 1, crate::PROTOCOL_V7).unwrap();
+        assert_eq!(result[0].column_type, CubridDataType::Sequence);
+        assert_eq!(result[0].collection_element_type, Some(CubridDataType::Double));
+    }
+
+    #[test]
+    fn test_parse_schema_column_metadata_collection_bare_element() {
+        // V7+: 0x80 set but collection_code bits are 0x00 — no collection,
+        // just use the element type directly.
+        let mut data = Vec::new();
+        data.push(0x80); // 0x80 | 0x00 (no collection bits)
+        data.push(8);    // element: INT
+        data.extend_from_slice(&0_i16.to_be_bytes());
+        data.extend_from_slice(&0_i32.to_be_bytes());
+        data.extend_from_slice(&2_i32.to_be_bytes());
+        data.extend_from_slice(b"x\0");
+        let mut cursor = &data[..];
+        let result = parse_schema_column_metadata(&mut cursor, 1, crate::PROTOCOL_V7).unwrap();
+        assert_eq!(result[0].column_type, CubridDataType::Int);
+        assert!(result[0].collection_element_type.is_none());
+    }
+
+    #[test]
+    fn test_parse_schema_column_metadata_v6_no_collection() {
+        // V6: no collection encoding, raw type code
+        let mut data = Vec::new();
+        data.push(2); // String
+        data.extend_from_slice(&0_i16.to_be_bytes());
+        data.extend_from_slice(&255_i32.to_be_bytes());
+        data.extend_from_slice(&2_i32.to_be_bytes());
+        data.extend_from_slice(b"n\0");
+        let mut cursor = &data[..];
+        let result = parse_schema_column_metadata(&mut cursor, 1, crate::PROTOCOL_V6).unwrap();
+        assert_eq!(result[0].column_type, CubridDataType::String);
+        assert!(result[0].collection_element_type.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // PrepareResponse: truncated payload at each field boundary (lines 531-565)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_prepare_response_truncated_cache_lifetime() {
+        // Empty payload: not enough bytes for cache_lifetime (4 bytes)
+        let data = build_frame([0, 0, 0, 0], 1, &[]);
+        let frame = ResponseFrame::parse(data).unwrap();
+        let result = PrepareResponse::parse(&frame, crate::PROTOCOL_V12);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated cache lifetime"));
+    }
+
+    #[test]
+    fn test_prepare_response_truncated_statement_type() {
+        // Only cache_lifetime (4 bytes), no statement type byte
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0_i32.to_be_bytes()); // cache_lifetime
+        let data = build_frame([0, 0, 0, 0], 1, &payload);
+        let frame = ResponseFrame::parse(data).unwrap();
+        let result = PrepareResponse::parse(&frame, crate::PROTOCOL_V12);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated statement type"));
+    }
+
+    #[test]
+    fn test_prepare_response_truncated_bind_count() {
+        // cache_lifetime + stmt_type but no bind_count
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0_i32.to_be_bytes()); // cache_lifetime
+        payload.push(21); // SELECT
+        let data = build_frame([0, 0, 0, 0], 1, &payload);
+        let frame = ResponseFrame::parse(data).unwrap();
+        let result = PrepareResponse::parse(&frame, crate::PROTOCOL_V12);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated bind count"));
+    }
+
+    #[test]
+    fn test_prepare_response_truncated_updatable_flag() {
+        // cache_lifetime + stmt_type + bind_count but no updatable flag
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0_i32.to_be_bytes()); // cache_lifetime
+        payload.push(21); // SELECT
+        payload.extend_from_slice(&0_i32.to_be_bytes()); // bind_count
+        let data = build_frame([0, 0, 0, 0], 1, &payload);
+        let frame = ResponseFrame::parse(data).unwrap();
+        let result = PrepareResponse::parse(&frame, crate::PROTOCOL_V12);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated updatable flag"));
+    }
+
+    #[test]
+    fn test_prepare_response_truncated_column_count() {
+        // cache_lifetime + stmt_type + bind_count + updatable but no column_count
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0_i32.to_be_bytes()); // cache_lifetime
+        payload.push(21); // SELECT
+        payload.extend_from_slice(&0_i32.to_be_bytes()); // bind_count
+        payload.push(0); // is_updatable
+        let data = build_frame([0, 0, 0, 0], 1, &payload);
+        let frame = ResponseFrame::parse(data).unwrap();
+        let result = PrepareResponse::parse(&frame, crate::PROTOCOL_V12);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated column count"));
+    }
+
+    // -----------------------------------------------------------------------
+    // SchemaInfoResponse: error, truncated, and negative paths (lines 613-636)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_schema_info_response_error() {
+        // Error frame should propagate error
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(-1_i32).to_be_bytes());
+        payload.extend_from_slice(&(-1001_i32).to_be_bytes());
+        payload.extend_from_slice(b"internal error\0");
+
+        let data = build_frame([0, 0, 0, 0], -1, &payload);
+        let frame = ResponseFrame::parse(data).unwrap();
+        let result = SchemaInfoResponse::parse(&frame, crate::PROTOCOL_V12);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_schema_info_response_truncated_num_tuple() {
+        // Empty payload: not enough bytes for num_tuple
+        let data = build_frame([0, 0, 0, 0], 1, &[]);
+        let frame = ResponseFrame::parse(data).unwrap();
+        let result = SchemaInfoResponse::parse(&frame, crate::PROTOCOL_V12);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated num_tuple"));
+    }
+
+    #[test]
+    fn test_schema_info_response_negative_num_tuple() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(-5_i32).to_be_bytes()); // negative num_tuple
+        let data = build_frame([0, 0, 0, 0], 1, &payload);
+        let frame = ResponseFrame::parse(data).unwrap();
+        let result = SchemaInfoResponse::parse(&frame, crate::PROTOCOL_V12);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("negative num_tuple"));
+    }
+
+    #[test]
+    fn test_schema_info_response_truncated_column_count() {
+        // num_tuple present but no column_count
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&3_i32.to_be_bytes()); // num_tuple = 3
+        let data = build_frame([0, 0, 0, 0], 1, &payload);
+        let frame = ResponseFrame::parse(data).unwrap();
+        let result = SchemaInfoResponse::parse(&frame, crate::PROTOCOL_V12);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated column count"));
+    }
+
+    #[test]
+    fn test_schema_info_response_success() {
+        // Valid schema info response with 1 column
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&2_i32.to_be_bytes()); // num_tuple = 2
+        payload.extend_from_slice(&1_i32.to_be_bytes()); // column_count = 1
+        // Schema column metadata (minimal): type(1) + scale(2) + precision(4) + name
+        payload.push(2); // String
+        payload.extend_from_slice(&0_i16.to_be_bytes()); // scale
+        payload.extend_from_slice(&255_i32.to_be_bytes()); // precision
+        payload.extend_from_slice(&5_i32.to_be_bytes()); // name length
+        payload.extend_from_slice(b"Name\0");
+
+        let data = build_frame([0, 0, 0, 0], 1, &payload);
+        let frame = ResponseFrame::parse(data).unwrap();
+        let resp = SchemaInfoResponse::parse(&frame, crate::PROTOCOL_V12).unwrap();
+        assert_eq!(resp.query_handle, 1);
+        assert_eq!(resp.num_tuple, 2);
+        assert_eq!(resp.columns.len(), 1);
+        assert_eq!(resp.columns[0].name, "Name");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_tuples: truncated paths (lines 741-798)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_tuples_truncated_tuple_index() {
+        // tuple_count=1, but not enough data for the 4-byte index
+        let data: Vec<u8> = vec![0, 0]; // only 2 bytes
+        let mut cursor = &data[..];
+        let result = parse_tuples(&mut cursor, 1, 1, &[CubridDataType::Int]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated tuple index"));
+    }
+
+    #[test]
+    fn test_parse_tuples_truncated_tuple_oid() {
+        // tuple_count=1, index present but OID truncated
+        let mut data = Vec::new();
+        data.extend_from_slice(&0_i32.to_be_bytes()); // index
+        data.extend_from_slice(&[0u8; 4]); // only 4 of 8 OID bytes
+        let mut cursor = &data[..];
+        let result = parse_tuples(&mut cursor, 1, 1, &[CubridDataType::Int]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated tuple OID"));
+    }
+
+    #[test]
+    fn test_parse_tuples_truncated_column_value_size() {
+        // tuple_count=1, index + OID present but column value size truncated
+        let mut data = Vec::new();
+        data.extend_from_slice(&0_i32.to_be_bytes()); // index
+        data.extend_from_slice(&[0u8; 8]); // OID
+        data.extend_from_slice(&[0, 0]); // only 2 bytes, need 4 for column size
+        let mut cursor = &data[..];
+        let result = parse_tuples(&mut cursor, 1, 1, &[CubridDataType::Int]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated column value size"));
+    }
+
+    #[test]
+    fn test_parse_tuples_truncated_column_value_data() {
+        // tuple_count=1, column value size says 10 bytes but only 3 available
+        let mut data = Vec::new();
+        data.extend_from_slice(&0_i32.to_be_bytes()); // index
+        data.extend_from_slice(&[0u8; 8]); // OID
+        data.extend_from_slice(&10_i32.to_be_bytes()); // column size = 10
+        data.extend_from_slice(&[1, 2, 3]); // only 3 bytes available
+        let mut cursor = &data[..];
+        let result = parse_tuples(&mut cursor, 1, 1, &[CubridDataType::Int]);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("truncated column value data"));
+    }
+
+    #[test]
+    fn test_parse_tuples_col_idx_beyond_column_types_defaults_to_null() {
+        // When col_idx >= column_types.len(), the type defaults to Null,
+        // triggering the embedded type code path (lines 781, 792-798).
+        let mut data = Vec::new();
+        data.extend_from_slice(&0_i32.to_be_bytes()); // index
+        data.extend_from_slice(&[0u8; 8]); // OID
+        // Column value: size=5, first byte is type code (INT=8), then 4 bytes of data
+        data.extend_from_slice(&5_i32.to_be_bytes()); // size = 5
+        data.push(8); // embedded type: INT
+        data.extend_from_slice(&99_i32.to_be_bytes()); // value = 99
+
+        // column_count=1 but empty column_types to force col_idx >= column_types.len()
+        let mut cursor = &data[..];
+        let result = parse_tuples(&mut cursor, 1, 1, &[]).unwrap();
+        assert_eq!(result.len(), 1);
+        match &result[0].values[0] {
+            ColumnValue::Data { data_type, data } => {
+                assert_eq!(*data_type, CubridDataType::Int);
+                assert_eq!(&data[..], &99_i32.to_be_bytes());
+            }
+            ColumnValue::Null => panic!("expected data, got null"),
+        }
+    }
+
+    #[test]
+    fn test_parse_tuples_null_column_type_embedded_type_code() {
+        // When column_types contains Null, the type code is embedded in the data
+        let mut data = Vec::new();
+        data.extend_from_slice(&0_i32.to_be_bytes()); // index
+        data.extend_from_slice(&[0u8; 8]); // OID
+        // Column value with embedded type: size=3, type=String(2), then "ab"
+        data.extend_from_slice(&3_i32.to_be_bytes()); // size = 3
+        data.push(2); // embedded type: String
+        data.extend_from_slice(b"ab"); // 2 bytes of string data
+
+        let mut cursor = &data[..];
+        let result = parse_tuples(&mut cursor, 1, 1, &[CubridDataType::Null]).unwrap();
+        assert_eq!(result.len(), 1);
+        match &result[0].values[0] {
+            ColumnValue::Data { data_type, data } => {
+                assert_eq!(*data_type, CubridDataType::String);
+                assert_eq!(&data[..], b"ab");
+            }
+            ColumnValue::Null => panic!("expected data, got null"),
+        }
+    }
+
+    #[test]
+    fn test_parse_tuples_embedded_type_code_size_too_small() {
+        // When embedded type code path has size < 1, it should error
+        // (lines 787-790). However, size <= 0 maps to Null, so we need
+        // size == 0 with column type Null. Actually size <= 0 gives Null.
+        // The embedded path only runs for size > 0. So we need size=1 but
+        // that means 0 bytes of actual data after the type code -- which
+        // is technically valid (empty data). Let's test that case.
+        let mut data = Vec::new();
+        data.extend_from_slice(&0_i32.to_be_bytes()); // index
+        data.extend_from_slice(&[0u8; 8]); // OID
+        // size=1: just the type code, no actual data
+        data.extend_from_slice(&1_i32.to_be_bytes()); // size = 1
+        data.push(8); // embedded type: INT
+
+        let mut cursor = &data[..];
+        let result = parse_tuples(&mut cursor, 1, 1, &[CubridDataType::Null]).unwrap();
+        match &result[0].values[0] {
+            ColumnValue::Data { data_type, data } => {
+                assert_eq!(*data_type, CubridDataType::Int);
+                assert!(data.is_empty()); // 0 bytes of value data
+            }
+            ColumnValue::Null => panic!("expected data, got null"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // ExecuteResponse: truncated paths (lines 856-881)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_execute_response_truncated_cache_reusable() {
+        // Empty payload: not enough for cache_reusable (1 byte)
+        let data = build_frame([0, 0, 0, 0], 1, &[]);
+        let frame = ResponseFrame::parse(data).unwrap();
+        let result = ExecuteResponse::parse(&frame, 0, &[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated cache reusable"));
+    }
+
+    #[test]
+    fn test_execute_response_truncated_result_count() {
+        // Only cache_reusable, no result_count
+        let data = build_frame([0, 0, 0, 0], 1, &[0]); // 1 byte: cache_reusable
+        let frame = ResponseFrame::parse(data).unwrap();
+        let result = ExecuteResponse::parse(&frame, 0, &[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated result count"));
+    }
+
+    #[test]
+    fn test_execute_response_truncated_result_info() {
+        // cache_reusable + result_count=1, but not enough bytes for ResultInfo
+        let mut payload = Vec::new();
+        payload.push(0); // cache_reusable
+        payload.extend_from_slice(&1_i32.to_be_bytes()); // result_count = 1
+        // ResultInfo needs 1+4+8+4+4 = 21 bytes; give only 5
+        payload.extend_from_slice(&[0u8; 5]);
+
+        let data = build_frame([0, 0, 0, 0], 1, &payload);
+        let frame = ResponseFrame::parse(data).unwrap();
+        let result = ExecuteResponse::parse(&frame, 0, &[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated result info"));
+    }
+
+    // -----------------------------------------------------------------------
+    // ExecuteResponse: include_column_info=1 multi-query path (lines 909-921)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_execute_response_include_column_info_multi_query() {
+        // Protocol V2+: includeColumnInfo=1 triggers parsing of inline
+        // column metadata (lines 908-927).
+        let mut payload = Vec::new();
+        payload.push(0); // cache_reusable
+        payload.extend_from_slice(&1_i32.to_be_bytes()); // result_count = 1
+        // ResultInfo for INSERT (no result set, so no inline fetch)
+        payload.push(20); // INSERT
+        payload.extend_from_slice(&1_i32.to_be_bytes()); // result_count
+        payload.extend_from_slice(&[0u8; 8]); // OID
+        payload.extend_from_slice(&0_i32.to_be_bytes()); // cache sec
+        payload.extend_from_slice(&0_i32.to_be_bytes()); // cache usec
+
+        // includeColumnInfo = 1 (multi-query)
+        payload.push(1);
+
+        // result_cache_lifetime(4) + stmt_type(1) + num_markers(4) = 9
+        payload.extend_from_slice(&0_i32.to_be_bytes()); // result_cache_lifetime
+        payload.push(21); // stmt_type (SELECT)
+        payload.extend_from_slice(&0_i32.to_be_bytes()); // num_markers
+
+        // updatable_flag(1) + column_count(4) + column metadata
+        payload.push(0); // updatable_flag
+        payload.extend_from_slice(&1_i32.to_be_bytes()); // column_count = 1
+
+        // One VARCHAR column metadata (same format as prepare)
+        payload.extend_from_slice(&build_varchar_column("multi_col"));
+
+        let data = build_frame([0, 0, 0, 0], 1, &payload);
+        let frame = ResponseFrame::parse(data).unwrap();
+        let resp = ExecuteResponse::parse(&frame, 2, &[]).unwrap();
+
+        assert_eq!(resp.total_tuple_count, 1);
+        assert_eq!(resp.results.len(), 1);
+        assert_eq!(resp.results[0].stmt_type, StatementType::Insert);
+    }
+
+    #[test]
+    fn test_execute_response_include_column_info_multi_query_zero_columns() {
+        // include_column_info=1 but col_count=0 (no column metadata to parse)
+        let mut payload = Vec::new();
+        payload.push(0); // cache_reusable
+        payload.extend_from_slice(&1_i32.to_be_bytes()); // result_count = 1
+        payload.push(20); // INSERT
+        payload.extend_from_slice(&1_i32.to_be_bytes());
+        payload.extend_from_slice(&[0u8; 8]); // OID
+        payload.extend_from_slice(&0_i32.to_be_bytes());
+        payload.extend_from_slice(&0_i32.to_be_bytes());
+
+        payload.push(1); // includeColumnInfo = 1
+        payload.extend_from_slice(&0_i32.to_be_bytes()); // result_cache_lifetime
+        payload.push(20); // stmt_type
+        payload.extend_from_slice(&0_i32.to_be_bytes()); // num_markers
+        payload.push(0); // updatable_flag
+        payload.extend_from_slice(&0_i32.to_be_bytes()); // column_count = 0
+
+        let data = build_frame([0, 0, 0, 0], 1, &payload);
+        let frame = ResponseFrame::parse(data).unwrap();
+        let resp = ExecuteResponse::parse(&frame, 2, &[]).unwrap();
+        assert_eq!(resp.total_tuple_count, 1);
+    }
+
+    #[test]
+    fn test_execute_response_include_column_info_partial_header() {
+        // include_column_info=1 but not enough data after the 9-byte header
+        // for updatable_flag. Should still succeed (graceful handling).
+        let mut payload = Vec::new();
+        payload.push(0); // cache_reusable
+        payload.extend_from_slice(&1_i32.to_be_bytes()); // result_count = 1
+        payload.push(20); // INSERT
+        payload.extend_from_slice(&1_i32.to_be_bytes());
+        payload.extend_from_slice(&[0u8; 8]); // OID
+        payload.extend_from_slice(&0_i32.to_be_bytes());
+        payload.extend_from_slice(&0_i32.to_be_bytes());
+
+        payload.push(1); // includeColumnInfo = 1
+        payload.extend_from_slice(&0_i32.to_be_bytes()); // result_cache_lifetime
+        payload.push(20); // stmt_type
+        payload.extend_from_slice(&0_i32.to_be_bytes()); // num_markers
+        // No updatable_flag or column_count follows
+
+        let data = build_frame([0, 0, 0, 0], 1, &payload);
+        let frame = ResponseFrame::parse(data).unwrap();
+        let resp = ExecuteResponse::parse(&frame, 2, &[]).unwrap();
+        assert_eq!(resp.total_tuple_count, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // FetchResult: truncated tuple count (lines 994-995)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_fetch_result_truncated_tuple_count() {
+        // Empty payload: not enough for 4-byte tuple_count
+        let data = build_frame([0, 0, 0, 0], 0, &[0, 0]); // only 2 bytes
+        let frame = ResponseFrame::parse(data).unwrap();
+        let result = FetchResult::parse(&frame, &[CubridDataType::Int]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("truncated fetch tuple count"));
+    }
+
+    // -----------------------------------------------------------------------
+    // DbParameterResponse: error path (line 1079)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_db_parameter_response_error() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(-1_i32).to_be_bytes());
+        payload.extend_from_slice(&(-1001_i32).to_be_bytes());
+        payload.extend_from_slice(b"internal error\0");
+
+        let data = build_frame([0, 0, 0, 0], -1, &payload);
+        let frame = ResponseFrame::parse(data).unwrap();
+        let result = DbParameterResponse::parse(&frame);
+        assert!(result.is_err());
+    }
 }

@@ -126,12 +126,26 @@ impl Connection for CubridConnection {
         let param_refs: Vec<&(dyn cubrid_types::ToSql + Sync)> =
             params.iter().map(|p| p as &(dyn cubrid_types::ToSql + Sync)).collect();
 
-        let affected = self
+        self.instrumentation()
+            .on_connection_event(InstrumentationEvent::start_query(&SqlStr(&sql)));
+
+        let result = self
             .client
             .execute_sql(&sql, &param_refs)
-            .map_err(cubrid_to_diesel_error)?;
+            .map_err(cubrid_to_diesel_error);
 
-        Ok(affected as usize)
+        match &result {
+            Ok(_) => {
+                self.instrumentation()
+                    .on_connection_event(InstrumentationEvent::finish_query(&SqlStr(&sql), None));
+            }
+            Err(e) => {
+                self.instrumentation()
+                    .on_connection_event(InstrumentationEvent::finish_query(&SqlStr(&sql), Some(e)));
+            }
+        }
+
+        Ok(result? as usize)
     }
 
     fn transaction_state(&mut self) -> &mut AnsiTransactionManager {
@@ -187,12 +201,26 @@ impl LoadConnection<DefaultLoadingMode> for CubridConnection {
         let param_refs: Vec<&(dyn cubrid_types::ToSql + Sync)> =
             params.iter().map(|p| p as &(dyn cubrid_types::ToSql + Sync)).collect();
 
-        let rows = self
+        self.instrumentation()
+            .on_connection_event(InstrumentationEvent::start_query(&SqlStr(&sql)));
+
+        let result = self
             .client
             .query_sql(&sql, &param_refs)
-            .map_err(cubrid_to_diesel_error)?;
+            .map_err(cubrid_to_diesel_error);
 
-        Ok(StatementIterator::new(rows))
+        match &result {
+            Ok(_) => {
+                self.instrumentation()
+                    .on_connection_event(InstrumentationEvent::finish_query(&SqlStr(&sql), None));
+            }
+            Err(e) => {
+                self.instrumentation()
+                    .on_connection_event(InstrumentationEvent::finish_query(&SqlStr(&sql), Some(e)));
+            }
+        }
+
+        Ok(StatementIterator::new(result?))
     }
 }
 
@@ -295,6 +323,25 @@ impl Instrumentation for NopInstrumentation {
     fn on_connection_event(&mut self, _event: InstrumentationEvent<'_>) {}
 }
 
+/// Wrapper for a SQL string that implements [`DebugQuery`] so it can be
+/// passed to [`InstrumentationEvent`]. Diesel's `StrQueryHelper` is
+/// `pub(crate)`, so third-party backends need their own equivalent.
+struct SqlStr<'a>(&'a str);
+
+impl std::fmt::Debug for SqlStr<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::fmt::Display for SqlStr<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl diesel::connection::DebugQuery for SqlStr<'_> {}
+
 // ---------------------------------------------------------------------------
 // Bind parameter bridge
 // ---------------------------------------------------------------------------
@@ -382,7 +429,7 @@ fn metadata_to_cubrid_type(meta: CubridTypeMetadata) -> cubrid_types::Type {
         CubridTypeMetadata::String => cubrid_types::Type::STRING,
         CubridTypeMetadata::Binary => cubrid_types::Type::VARBIT,
         CubridTypeMetadata::Date => cubrid_types::Type::DATE,
-        CubridTypeMetadata::Time => cubrid_types::Type::TIME,
+        CubridTypeMetadata::Time => cubrid_types::Type::STRING,
         CubridTypeMetadata::Timestamp => cubrid_types::Type::TIMESTAMP,
         CubridTypeMetadata::Numeric => cubrid_types::Type::NUMERIC,
     }

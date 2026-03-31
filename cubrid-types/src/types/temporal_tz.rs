@@ -617,4 +617,34 @@ mod tests {
             assert_eq!(&decoded.timezone, *tz);
         }
     }
+
+    // -- from_sql insufficient bytes error paths --
+
+    #[test]
+    fn test_timestamp_tz_from_sql_too_short() {
+        let result = CubridTimestampTz::from_sql(&Type::TIMESTAMP_TZ, &[0u8; 12]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("13 bytes"));
+    }
+
+    #[test]
+    fn test_timestamp_ltz_from_sql_too_short() {
+        let result = CubridTimestampLtz::from_sql(&Type::TIMESTAMP_LTZ, &[0u8; 12]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("13 bytes"));
+    }
+
+    #[test]
+    fn test_datetime_tz_from_sql_too_short() {
+        let result = CubridDateTimeTz::from_sql(&Type::DATETIME_TZ, &[0u8; 14]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("15 bytes"));
+    }
+
+    #[test]
+    fn test_datetime_ltz_from_sql_too_short() {
+        let result = CubridDateTimeLtz::from_sql(&Type::DATETIME_LTZ, &[0u8; 14]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("15 bytes"));
+    }
 }

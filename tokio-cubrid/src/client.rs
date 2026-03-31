@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, oneshot};
 use cubrid_protocol::authentication::BrokerInfo;
 use cubrid_protocol::cas_info::CasInfo;
 use cubrid_protocol::message::backend::{
-    self, DbVersionResponse, ExecuteResponse, FetchResult, PrepareResponse, ResponseFrame,
+    DbVersionResponse, ExecuteResponse, FetchResult, PrepareResponse, ResponseFrame,
     SchemaInfoResponse,
 };
 use cubrid_protocol::message::frontend;
@@ -45,7 +45,11 @@ use crate::version::{CubridDialect, CubridVersion};
 /// This is wrapped in an `Arc` so that cloned `Client` instances and the
 /// `Connection` background task can share the same communication channel
 /// and session state.
-pub(crate) struct InnerClient {
+/// Internal shared state of the client.
+///
+/// Exposed as public for testing; not part of the stable API.
+#[doc(hidden)]
+pub struct InnerClient {
     /// Channel sender for dispatching requests to the background connection.
     pub sender: mpsc::UnboundedSender<Request>,
     /// Current CAS info, updated after every server response.
@@ -123,8 +127,12 @@ impl Client {
     /// Create a new Client from shared inner state and version information.
     ///
     /// Retained for testing; production code uses [`new_with_config`].
+    /// Create a new Client from shared inner state and version information.
+    ///
+    /// Exposed as public for testing; not part of the stable API.
+    #[doc(hidden)]
     #[allow(dead_code)]
-    pub(crate) fn new(
+    pub fn new(
         inner: Arc<InnerClient>,
         version: CubridVersion,
         dialect: CubridDialect,
@@ -227,7 +235,11 @@ impl Client {
     /// still be processed by the server, but the response is discarded.
     /// Avoid cancelling in-flight requests (e.g., via `tokio::select!`);
     /// instead, let them complete and discard the result.
-    pub(crate) async fn send_request(&self, data: BytesMut) -> Result<ResponseFrame, Error> {
+    /// Sends a pre-serialized request to the background connection.
+    ///
+    /// Exposed as public for testing; not part of the stable API.
+    #[doc(hidden)]
+    pub async fn send_request(&self, data: BytesMut) -> Result<ResponseFrame, Error> {
         let (tx, rx) = oneshot::channel();
 
         let request = Request { data, sender: tx };
@@ -473,20 +485,17 @@ impl Client {
     /// multiple clones of the same client simultaneously.
     pub async fn transaction(&mut self) -> Result<Transaction<'_>, Error> {
         // Disable auto-commit for the duration of the transaction.
-        // CCI_PARAM_AUTO_COMMIT = 4, 0 = off
-        let msg = frontend::set_db_parameter(&self.cas_info(), 4, 0);
-        let frame = self.send_request(msg).await?;
-        backend::parse_simple_response(&frame)?;
+        // CCI manages autocommit client-side via the auto_commit parameter
+        // in individual requests (prepare/execute/close). The CasInfo is
+        // echoed as-is from the server — we never modify its autocommit
+        // flag, because doing so causes CAS to close the TCP socket under
+        // KEEP_CONNECTION=AUTO mode.
         self.inner.auto_commit.store(false, Ordering::Relaxed);
         Ok(Transaction::new(self))
     }
 
     /// Re-enable auto-commit after a transaction completes.
     pub(crate) async fn restore_auto_commit(&self) -> Result<(), Error> {
-        // Always restore to true (the original default)
-        let msg = frontend::set_db_parameter(&self.cas_info(), 4, 1);
-        let frame = self.send_request(msg).await?;
-        backend::parse_simple_response(&frame)?;
         self.inner.auto_commit.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -504,10 +513,13 @@ impl Client {
     /// Intended for ORM/Diesel integration that needs direct control
     /// over the autocommit state. Prefer [`transaction()`] for normal use.
     pub async fn set_autocommit(&self, enabled: bool) -> Result<(), Error> {
-        let val = if enabled { 1 } else { 0 };
-        let msg = frontend::set_db_parameter(&self.cas_info(), 4, val);
-        let frame = self.send_request(msg).await?;
-        backend::parse_simple_response(&frame)?;
+        // CCI manages autocommit purely client-side — it does NOT send
+        // SET_DB_PARAMETER for autocommit changes. The autocommit state
+        // is communicated through the auto_commit parameter in individual
+        // PREPARE/EXECUTE/CLOSE requests. CasInfo is echoed as-is from
+        // the server and never modified by the client, because setting the
+        // autocommit flag in CasInfo causes CAS to close the TCP socket
+        // under KEEP_CONNECTION=AUTO mode.
         self.inner.auto_commit.store(enabled, Ordering::Relaxed);
         Ok(())
     }
@@ -693,7 +705,11 @@ impl Client {
     /// Sends the rollback message through the channel without waiting for
     /// a response. If the channel is closed (e.g., the connection was
     /// dropped), the failure is logged at debug level but otherwise ignored.
-    pub(crate) fn rollback_fire_and_forget(&self) {
+    /// Fire-and-forget rollback for use in Drop contexts.
+    ///
+    /// Exposed as public for testing; not part of the stable API.
+    #[doc(hidden)]
+    pub fn rollback_fire_and_forget(&self) {
         let msg = frontend::end_tran(&self.cas_info(), TransactionOp::Rollback);
         let (tx, _rx) = oneshot::channel();
         let request = Request { data: msg, sender: tx };
@@ -703,7 +719,11 @@ impl Client {
     }
 
     /// Fire-and-forget rollback to a named savepoint (for Drop contexts).
-    pub(crate) fn rollback_to_savepoint_fire_and_forget(&self, name: &str) {
+    /// Fire-and-forget rollback to a named savepoint (for Drop contexts).
+    ///
+    /// Exposed as public for testing; not part of the stable API.
+    #[doc(hidden)]
+    pub fn rollback_to_savepoint_fire_and_forget(&self, name: &str) {
         let msg = frontend::savepoint(&self.cas_info(), 2, name);
         let (tx, _rx) = oneshot::channel();
         let request = Request { data: msg, sender: tx };
@@ -712,14 +732,10 @@ impl Client {
         }
     }
 
-    /// Fire-and-forget auto-commit restore (for Drop contexts).
+    /// Restore auto-commit (for Drop contexts).
+    ///
+    /// No network round-trip needed: autocommit is managed client-side.
     pub(crate) fn restore_auto_commit_fire_and_forget(&self) {
-        let msg = frontend::set_db_parameter(&self.cas_info(), 4, 1);
-        let (tx, _rx) = oneshot::channel();
-        let request = Request { data: msg, sender: tx };
-        if self.inner.sender.send(request).is_err() {
-            log::debug!("restore-auto-commit fire-and-forget: channel closed");
-        }
         self.inner.auto_commit.store(true, Ordering::Relaxed);
     }
 
