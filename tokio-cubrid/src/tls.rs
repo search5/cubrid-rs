@@ -10,7 +10,8 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use tokio::io::{AsyncRead, AsyncWrite};
+use std::task::{Context, Poll};
+use tokio::io::{self, AsyncRead, AsyncWrite, ReadBuf};
 
 /// Factory trait for creating TLS connectors.
 ///
@@ -20,7 +21,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 /// The `S` type parameter is the underlying stream (typically `TcpStream`).
 pub trait MakeTlsConnect<S> {
     /// The encrypted stream type produced after the TLS handshake.
-    type Stream: AsyncRead + AsyncWrite + Unpin + Send;
+    type Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static;
     /// The TLS connector type returned by this factory.
     type TlsConnect: TlsConnect<S, Stream = Self::Stream>;
     /// The error type for connector creation.
@@ -35,7 +36,7 @@ pub trait MakeTlsConnect<S> {
 /// Implementations perform the actual TLS handshake on a connected socket.
 pub trait TlsConnect<S> {
     /// The encrypted stream type produced after the TLS handshake.
-    type Stream: AsyncRead + AsyncWrite + Unpin + Send;
+    type Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static;
     /// The error type for the TLS handshake.
     type Error: Into<Box<dyn std::error::Error + Sync + Send>>;
     /// The future returned by [`connect`](TlsConnect::connect).
@@ -96,6 +97,68 @@ where
     fn connect(self, stream: S) -> Self::Future {
         // NoTls simply passes through the stream without any TLS handshake.
         Box::pin(async move { Ok(stream) })
+    }
+}
+
+/// A stream that may or may not be encrypted with TLS.
+///
+/// When `SslMode::Disable` is used, the inner stream is the raw TCP socket.
+/// When TLS is negotiated, it wraps the TLS-encrypted stream instead.
+/// This enum implements [`AsyncRead`] and [`AsyncWrite`] by delegating to
+/// whichever variant is active.
+#[derive(Debug)]
+pub enum MaybeTlsStream<S, T> {
+    /// Plain (unencrypted) stream.
+    Raw(S),
+    /// TLS-encrypted stream.
+    Tls(T),
+}
+
+impl<S, T> AsyncRead for MaybeTlsStream<S, T>
+where
+    S: AsyncRead + Unpin,
+    T: AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            MaybeTlsStream::Raw(s) => Pin::new(s).poll_read(cx, buf),
+            MaybeTlsStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl<S, T> AsyncWrite for MaybeTlsStream<S, T>
+where
+    S: AsyncWrite + Unpin,
+    T: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            MaybeTlsStream::Raw(s) => Pin::new(s).poll_write(cx, buf),
+            MaybeTlsStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            MaybeTlsStream::Raw(s) => Pin::new(s).poll_flush(cx),
+            MaybeTlsStream::Tls(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            MaybeTlsStream::Raw(s) => Pin::new(s).poll_shutdown(cx),
+            MaybeTlsStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
+        }
     }
 }
 
@@ -250,5 +313,92 @@ mod tests {
     fn test_no_tls_connect_debug() {
         let connector = NoTlsConnect;
         assert_eq!(format!("{:?}", connector), "NoTlsConnect");
+    }
+
+    // -----------------------------------------------------------------------
+    // MaybeTlsStream tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_maybe_tls_stream_debug_raw() {
+        let (client, _server) = tokio::io::duplex(64);
+        let stream: MaybeTlsStream<tokio::io::DuplexStream, tokio::io::DuplexStream> =
+            MaybeTlsStream::Raw(client);
+        let debug = format!("{:?}", stream);
+        assert!(debug.starts_with("Raw("));
+    }
+
+    #[test]
+    fn test_maybe_tls_stream_debug_tls() {
+        let (client, _server) = tokio::io::duplex(64);
+        let stream: MaybeTlsStream<tokio::io::DuplexStream, tokio::io::DuplexStream> =
+            MaybeTlsStream::Tls(client);
+        let debug = format!("{:?}", stream);
+        assert!(debug.starts_with("Tls("));
+    }
+
+    #[tokio::test]
+    async fn test_maybe_tls_stream_raw_read_write() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, mut server) = tokio::io::duplex(256);
+        let mut stream: MaybeTlsStream<tokio::io::DuplexStream, tokio::io::DuplexStream> =
+            MaybeTlsStream::Raw(client);
+
+        // Write through MaybeTlsStream::Raw, read from the other end.
+        stream.write_all(b"hello raw").await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut buf = [0u8; 16];
+        let n = server.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello raw");
+
+        // Write from server, read through MaybeTlsStream::Raw.
+        server.write_all(b"reply raw").await.unwrap();
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"reply raw");
+    }
+
+    #[tokio::test]
+    async fn test_maybe_tls_stream_tls_variant_read_write() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // The Tls variant wraps the same stream type in tests (DuplexStream).
+        // This verifies the Tls arm of the match delegates correctly.
+        let (client, mut server) = tokio::io::duplex(256);
+        let mut stream: MaybeTlsStream<tokio::io::DuplexStream, tokio::io::DuplexStream> =
+            MaybeTlsStream::Tls(client);
+
+        stream.write_all(b"hello tls").await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut buf = [0u8; 16];
+        let n = server.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello tls");
+
+        server.write_all(b"reply tls").await.unwrap();
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"reply tls");
+    }
+
+    #[tokio::test]
+    async fn test_maybe_tls_stream_shutdown() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client, _server) = tokio::io::duplex(64);
+        let mut stream: MaybeTlsStream<tokio::io::DuplexStream, tokio::io::DuplexStream> =
+            MaybeTlsStream::Raw(client);
+        // shutdown should complete without error.
+        stream.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_maybe_tls_stream_tls_variant_shutdown() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client, _server) = tokio::io::duplex(64);
+        let mut stream: MaybeTlsStream<tokio::io::DuplexStream, tokio::io::DuplexStream> =
+            MaybeTlsStream::Tls(client);
+        stream.shutdown().await.unwrap();
     }
 }

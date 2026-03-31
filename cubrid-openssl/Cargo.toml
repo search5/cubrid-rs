@@ -12,3 +12,9 @@ readme = "../README.md"
 
 [dependencies]
 tokio-cubrid = { path = "../tokio-cubrid" }
+openssl = "0.10"
+tokio = "1"
+tokio-openssl = "0.6"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

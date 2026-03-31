@@ -7,10 +7,12 @@
 
 use cubrid_protocol::authentication::BrokerInfo;
 use cubrid_types::ToSql;
+use tokio::net::TcpStream;
 use tokio::runtime::Runtime;
 
 use tokio_cubrid::Config;
 use tokio_cubrid::Error;
+use tokio_cubrid::MakeTlsConnect;
 use tokio_cubrid::Row;
 use tokio_cubrid::SchemaType;
 use tokio_cubrid::Statement;
@@ -57,12 +59,28 @@ impl Client {
     /// Connect to a CUBRID database.
     ///
     /// Creates an internal tokio runtime, performs the two-phase handshake,
-    /// and spawns the background `Connection` task.
+    /// and spawns the background `Connection` task. Uses unencrypted
+    /// connections (the CUBRID default).
+    ///
+    /// For TLS support, use [`connect_tls`](Client::connect_tls).
     pub fn connect(config: &Config) -> Result<Client, Error> {
+        Self::connect_tls(config, tokio_cubrid::NoTls)
+    }
+
+    /// Connect to a CUBRID database with a TLS backend.
+    ///
+    /// Like [`connect`](Client::connect), but accepts a `MakeTlsConnect`
+    /// implementation for encrypted connections.
+    pub fn connect_tls<T>(config: &Config, tls: T) -> Result<Client, Error>
+    where
+        T: MakeTlsConnect<TcpStream> + Send + 'static,
+        T::TlsConnect: Send,
+        T::Stream: Send,
+    {
         let runtime = Runtime::new().map_err(Error::Io)?;
 
         let client = runtime.block_on(async {
-            let (client, connection) = tokio_cubrid::connect(config).await?;
+            let (client, connection) = tokio_cubrid::connect_tls(config, tls).await?;
             tokio::spawn(connection);
             Ok::<_, Error>(client)
         })?;

@@ -387,3 +387,146 @@ async fn test_large_bind_parameter() {
 
     client.execute_sql("DROP TABLE up_large_param", &[]).await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// TLS integration tests
+//
+// These tests require a CUBRID server with TLS enabled. They cover the
+// connect.rs code paths that combine TLS with the CUBRID two-phase
+// handshake (broker port negotiation → TLS upgrade → DB authentication).
+//
+// Prerequisites:
+//   1. CUBRID broker configured with SSL (cubrid_broker.conf: SSL = ON)
+//   2. Server certificate and CA cert available
+//   3. Environment variables:
+//        CUBRID_TEST_TLS_PORT  — broker port with SSL enabled (e.g. 33443)
+//        CUBRID_TEST_CA_CERT   — path to CA certificate PEM file
+//
+// Run with:
+//   CUBRID_TEST_TLS_PORT=33443 CUBRID_TEST_CA_CERT=/path/to/ca.pem \
+//     cargo test -p tokio-cubrid --test untested_paths tls -- --test-threads=1
+// ---------------------------------------------------------------------------
+
+/// Check whether TLS test prerequisites are met.
+fn tls_test_config() -> Option<(Config, String)> {
+    let port: u16 = std::env::var("CUBRID_TEST_TLS_PORT").ok()?.parse().ok()?;
+    let ca_cert = std::env::var("CUBRID_TEST_CA_CERT").ok()?;
+
+    let mut config = Config::new();
+    config
+        .host("localhost")
+        .port(port)
+        .user("dba")
+        .password("")
+        .dbname("testdb");
+    Some((config.clone(), ca_cert))
+}
+
+/// try_connect with SslMode::Require — success path.
+/// Covers: connect.rs SslMode::Require branch, finish_connect via TLS stream.
+#[tokio::test]
+#[ignore = "requires CUBRID server with TLS (set CUBRID_TEST_TLS_PORT and CUBRID_TEST_CA_CERT)"]
+async fn tls_connect_require_success() {
+    let (config, ca_cert) = tls_test_config().expect("TLS env vars not set");
+    let mut config = config;
+    config.ssl_mode(tokio_cubrid::SslMode::Require);
+
+    let connector = make_tls_connector(&ca_cert);
+    let (client, connection) = tokio_cubrid::connect_tls(&config, connector).await.unwrap();
+    tokio::spawn(connection);
+
+    let rows = client.query_sql("SELECT 1 + 1 AS result", &[]).await.unwrap();
+    let sum: i32 = rows[0].get("result");
+    assert_eq!(sum, 2);
+}
+
+/// try_connect with SslMode::Require — failure (no TLS server).
+/// Covers: connect.rs Error::Tls generation in Require branch.
+#[tokio::test]
+#[ignore = "requires CUBRID server WITHOUT TLS on CUBRID_TEST_PORT"]
+async fn tls_connect_require_failure() {
+    let config = test_config();
+    let mut config = config;
+    config.ssl_mode(tokio_cubrid::SslMode::Require);
+
+    // Use a dummy CA — handshake should fail because the server
+    // does not support TLS on the normal port.
+    let builder = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls()).unwrap();
+    let connector = cubrid_openssl::MakeTlsConnector::new(builder.build());
+
+    let result = tokio_cubrid::connect_tls(&config, connector).await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(err.is_closed(), "TLS error should indicate closed: {err}");
+}
+
+/// try_connect with SslMode::Prefer — TLS available.
+/// Covers: connect.rs SslMode::Prefer success branch.
+#[tokio::test]
+#[ignore = "requires CUBRID server with TLS (set CUBRID_TEST_TLS_PORT and CUBRID_TEST_CA_CERT)"]
+async fn tls_connect_prefer_with_tls() {
+    let (config, ca_cert) = tls_test_config().expect("TLS env vars not set");
+    let mut config = config;
+    config.ssl_mode(tokio_cubrid::SslMode::Prefer);
+
+    let connector = make_tls_connector(&ca_cert);
+    let (client, connection) = tokio_cubrid::connect_tls(&config, connector).await.unwrap();
+    tokio::spawn(connection);
+
+    let rows = client.query_sql("SELECT 1", &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+}
+
+/// try_connect with SslMode::Prefer — TLS not available, falls back to plain.
+/// Covers: connect.rs SslMode::Prefer fallback branch, renegotiate_plain().
+#[tokio::test]
+#[ignore = "requires CUBRID server WITHOUT TLS on CUBRID_TEST_PORT"]
+async fn tls_connect_prefer_fallback_to_plain() {
+    let config = test_config();
+    let mut config = config;
+    config.ssl_mode(tokio_cubrid::SslMode::Prefer);
+
+    // Use a connector that will fail TLS handshake against a non-TLS server.
+    let builder = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls()).unwrap();
+    let connector = cubrid_openssl::MakeTlsConnector::new(builder.build());
+
+    // Should succeed by falling back to plain TCP.
+    let (client, connection) = tokio_cubrid::connect_tls(&config, connector).await.unwrap();
+    tokio::spawn(connection);
+
+    let rows = client.query_sql("SELECT 1 + 1 AS result", &[]).await.unwrap();
+    let sum: i32 = rows[0].get("result");
+    assert_eq!(sum, 2);
+}
+
+/// connect_tls() top-level function.
+/// Covers: lib.rs connect_tls(), do_connect() with TLS parameter.
+#[tokio::test]
+#[ignore = "requires CUBRID server with TLS (set CUBRID_TEST_TLS_PORT and CUBRID_TEST_CA_CERT)"]
+async fn tls_connect_tls_function() {
+    let (config, ca_cert) = tls_test_config().expect("TLS env vars not set");
+    let mut config = config;
+    config.ssl_mode(tokio_cubrid::SslMode::Require);
+
+    let connector = make_tls_connector(&ca_cert);
+    let (client, connection) = tokio_cubrid::connect_tls(&config, connector).await.unwrap();
+    tokio::spawn(connection);
+
+    // Verify full query lifecycle over TLS.
+    let version = client.version();
+    assert!(version.major >= 10);
+
+    client.execute_sql("CREATE TABLE IF NOT EXISTS tls_test (id INT)", &[]).await.unwrap();
+    client.execute_sql("INSERT INTO tls_test VALUES (42)", &[]).await.unwrap();
+    let rows = client.query_sql("SELECT id FROM tls_test", &[]).await.unwrap();
+    let id: i32 = rows[0].get("id");
+    assert_eq!(id, 42);
+    client.execute_sql("DROP TABLE tls_test", &[]).await.unwrap();
+}
+
+/// Helper: build a MakeTlsConnector that trusts the given CA cert file.
+fn make_tls_connector(ca_cert_path: &str) -> cubrid_openssl::MakeTlsConnector {
+    let mut builder = openssl::ssl::SslConnector::builder(openssl::ssl::SslMethod::tls()).unwrap();
+    builder.set_ca_file(ca_cert_path).unwrap();
+    cubrid_openssl::MakeTlsConnector::new(builder.build())
+}

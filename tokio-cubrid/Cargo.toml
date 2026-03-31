@@ -24,3 +24,5 @@ thiserror = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+cubrid-openssl = { path = "../cubrid-openssl" }
+openssl = "0.10"

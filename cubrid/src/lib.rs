@@ -31,6 +31,7 @@ pub use tokio_cubrid::Row;
 pub use tokio_cubrid::SslMode;
 pub use tokio_cubrid::Statement;
 pub use tokio_cubrid::{Column, CubridDialect, CubridVersion};
+pub use tokio_cubrid::MakeTlsConnect;
 
 // Re-export SchemaType and BrokerInfo for use with Client metadata methods.
 pub use tokio_cubrid::SchemaType;
@@ -56,6 +57,9 @@ pub use transaction::Transaction;
 /// Returns a synchronous [`Client`] that manages its own tokio runtime
 /// internally. The background `Connection` task is spawned automatically.
 ///
+/// Uses unencrypted connections (the CUBRID default). For TLS support,
+/// use [`connect_tls`].
+///
 /// # Example
 ///
 /// ```no_run
@@ -64,4 +68,17 @@ pub use transaction::Transaction;
 /// ```
 pub fn connect(config: &Config) -> Result<Client, Error> {
     Client::connect(config)
+}
+
+/// Connect to a CUBRID database with a TLS backend.
+///
+/// Like [`connect`], but accepts a `MakeTlsConnect` implementation for
+/// encrypted connections.
+pub fn connect_tls<T>(config: &Config, tls: T) -> Result<Client, Error>
+where
+    T: MakeTlsConnect<tokio::net::TcpStream> + Send + 'static,
+    T::TlsConnect: Send,
+    T::Stream: Send,
+{
+    Client::connect_tls(config, tls)
 }

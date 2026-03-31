@@ -62,6 +62,8 @@ pub(crate) struct Request {
 /// The connection background task.
 ///
 /// Implements [`Future`] so it can be directly passed to `tokio::spawn`.
+/// The stream type is erased internally, so this type has no generic
+/// parameters — users never need to name the stream type.
 ///
 /// # Cancellation safety
 ///
@@ -79,120 +81,114 @@ pub(crate) struct Request {
 /// # Ok(())
 /// # }
 /// ```
-pub struct Connection<S>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+pub struct Connection {
     /// The boxed inner future that drives the I/O loop.
     inner: Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>,
-    /// Phantom to keep S in the type signature (for public API clarity).
-    _marker: std::marker::PhantomData<S>,
 }
 
-impl<S> std::fmt::Debug for Connection<S>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+impl std::fmt::Debug for Connection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Connection").finish_non_exhaustive()
     }
 }
 
-impl<S> Connection<S>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+impl Connection {
     /// Create a new connection from a framed stream, request receiver, and
     /// initial CAS info from the handshake.
     ///
     /// The CAS info is tracked across responses and used to send a
     /// `CON_CLOSE` message when all clients disconnect.
-    pub(crate) fn new(
+    ///
+    /// The stream type `S` is erased into a boxed future, so the resulting
+    /// `Connection` carries no generic parameters.
+    pub(crate) fn new<S>(
         stream: Framed<S, CubridCodec>,
         receiver: tokio::sync::mpsc::UnboundedReceiver<Request>,
         initial_cas_info: CasInfo,
-    ) -> Self {
+    ) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         // Box the async I/O loop so Connection itself implements Future.
-        let inner = Box::pin(Self::run_loop(stream, receiver, initial_cas_info));
-        Connection {
-            inner,
-            _marker: std::marker::PhantomData,
+        let inner = Box::pin(run_loop(stream, receiver, initial_cas_info));
+        Connection { inner }
+    }
+}
+
+/// The I/O loop that processes requests one at a time.
+///
+/// 1. Wait for a request from the client channel.
+/// 2. Send the request data over the wire.
+/// 3. Read the response from the wire.
+/// 4. Parse the response and deliver it to the caller.
+/// 5. Repeat.
+///
+/// The loop terminates when the client drops all senders (channel closes).
+/// A `CON_CLOSE` message is sent as a best-effort cleanup before returning.
+async fn run_loop<S>(
+    mut stream: Framed<S, CubridCodec>,
+    mut receiver: tokio::sync::mpsc::UnboundedReceiver<Request>,
+    initial_cas_info: CasInfo,
+) -> Result<(), Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut cas_info = initial_cas_info;
+
+    while let Some(request) = receiver.recv().await {
+        let result = process_request(&mut stream, request.data).await;
+        // Track the latest CAS info from successful responses.
+        if let Ok(ref frame) = result {
+            cas_info = frame.cas_info;
+        }
+        // If the caller dropped the oneshot receiver, the send fails.
+        // This can happen if the caller timed out or was cancelled (M26).
+        if request.sender.send(result).is_err() {
+            log::debug!("Response dropped: caller cancelled or timed out");
         }
     }
 
-    /// The I/O loop that processes requests one at a time.
-    ///
-    /// 1. Wait for a request from the client channel.
-    /// 2. Send the request data over the wire.
-    /// 3. Read the response from the wire.
-    /// 4. Parse the response and deliver it to the caller.
-    /// 5. Repeat.
-    ///
-    /// The loop terminates when the client drops all senders (channel closes).
-    /// A `CON_CLOSE` message is sent as a best-effort cleanup before returning.
-    async fn run_loop(
-        mut stream: Framed<S, CubridCodec>,
-        mut receiver: tokio::sync::mpsc::UnboundedReceiver<Request>,
-        initial_cas_info: CasInfo,
-    ) -> Result<(), Error> {
-        let mut cas_info = initial_cas_info;
+    // Send CON_CLOSE to gracefully terminate the CAS session.
+    // Best-effort: ignore errors (the server may already be gone).
+    let close_msg = frontend::con_close(&cas_info);
+    let _ = stream.send(close_msg).await;
 
-        while let Some(request) = receiver.recv().await {
-            let result = Self::process_request(&mut stream, request.data).await;
-            // Track the latest CAS info from successful responses.
-            // Track the latest CAS info from successful responses.
-            if let Ok(ref frame) = result {
-                cas_info = frame.cas_info;
-            }
-            // If the caller dropped the oneshot receiver, the send fails.
-            // This can happen if the caller timed out or was cancelled (M26).
-            if request.sender.send(result).is_err() {
-                log::debug!("Response dropped: caller cancelled or timed out");
-            }
-        }
+    Ok(())
+}
 
-        // Send CON_CLOSE to gracefully terminate the CAS session.
-        // Best-effort: ignore errors (the server may already be gone).
-        let close_msg = frontend::con_close(&cas_info);
-        let _ = stream.send(close_msg).await;
+/// Send a single request and read its response.
+async fn process_request<S>(
+    stream: &mut Framed<S, CubridCodec>,
+    data: BytesMut,
+) -> Result<ResponseFrame, Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    // Send the request bytes
+    stream.send(data).await.map_err(Error::Protocol)?;
 
-        Ok(())
-    }
+    // Read the response frame
+    let response_bytes = stream
+        .next()
+        .await
+        .ok_or(Error::Closed)?
+        .map_err(Error::Protocol)?;
 
-    /// Send a single request and read its response.
-    async fn process_request(
-        stream: &mut Framed<S, CubridCodec>,
-        data: BytesMut,
-    ) -> Result<ResponseFrame, Error> {
-        // Send the request bytes
-        stream.send(data).await.map_err(Error::Protocol)?;
+    // Parse the response frame and return it to the caller.
+    // Error checking (negative response_code) is handled by the
+    // response-specific parsers in the client layer, not here.
+    // This avoids double error handling and preserves structured
+    // error information for the caller.
+    let frame = ResponseFrame::parse(response_bytes.freeze()).map_err(Error::Protocol)?;
 
-        // Read the response frame
-        let response_bytes = stream
-            .next()
-            .await
-            .ok_or(Error::Closed)?
-            .map_err(Error::Protocol)?;
-
-        // Parse the response frame and return it to the caller.
-        // Error checking (negative response_code) is handled by the
-        // response-specific parsers in the client layer, not here.
-        // This avoids double error handling and preserves structured
-        // error information for the caller.
-        let frame = ResponseFrame::parse(response_bytes.freeze()).map_err(Error::Protocol)?;
-
-        Ok(frame)
-    }
+    Ok(frame)
 }
 
 // ---------------------------------------------------------------------------
 // Future impl — allows `tokio::spawn(connection)` directly
 // ---------------------------------------------------------------------------
 
-impl<S> Future for Connection<S>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+impl Future for Connection {
     type Output = Result<(), Error>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {

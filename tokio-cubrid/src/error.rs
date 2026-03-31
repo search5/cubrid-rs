@@ -51,6 +51,10 @@ pub enum Error {
     #[error("column not found: {0}")]
     ColumnNotFound(String),
 
+    /// TLS handshake or configuration error.
+    #[error("TLS error: {0}")]
+    Tls(Box<dyn std::error::Error + Sync + Send>),
+
     /// Type conversion error.
     #[error("type conversion: {0}")]
     Conversion(#[from] Box<dyn std::error::Error + Sync + Send>),
@@ -84,7 +88,7 @@ impl Error {
 
     /// Returns `true` if this error indicates the connection is no longer usable.
     pub fn is_closed(&self) -> bool {
-        matches!(self, Error::Closed | Error::Io(_))
+        matches!(self, Error::Closed | Error::Io(_) | Error::Tls(_))
     }
 
     /// Returns the database error code, if this is a [`Error::Database`] variant.
@@ -234,6 +238,24 @@ mod tests {
 
         assert_eq!(Error::Closed.db_code(), None);
         assert_eq!(Error::Timeout.db_code(), None);
+    }
+
+    #[test]
+    fn test_display_tls() {
+        let inner: Box<dyn std::error::Error + Sync + Send> =
+            "certificate verification failed".into();
+        let err = Error::Tls(inner);
+        assert_eq!(
+            err.to_string(),
+            "TLS error: certificate verification failed"
+        );
+    }
+
+    #[test]
+    fn test_tls_is_closed() {
+        let inner: Box<dyn std::error::Error + Sync + Send> =
+            "handshake failed".into();
+        assert!(Error::Tls(inner).is_closed());
     }
 
     #[test]

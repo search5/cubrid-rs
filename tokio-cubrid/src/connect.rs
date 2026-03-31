@@ -18,7 +18,7 @@
 //!    the SQL dialect capabilities.
 
 use bytes::{Buf, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
@@ -34,6 +34,7 @@ use cubrid_protocol::{DRIVER_SESSION_SIZE, NET_SIZE_CAS_INFO, NET_SIZE_INT};
 use crate::config::Config;
 use crate::connection::{Connection, Request};
 use crate::error::Error;
+use crate::tls::{MakeTlsConnect, MaybeTlsStream, SslMode, TlsConnect};
 use crate::version::{CubridDialect, CubridVersion};
 
 // ---------------------------------------------------------------------------
@@ -44,46 +45,7 @@ use crate::version::{CubridDialect, CubridVersion};
 ///
 /// Contains all state needed to construct a `Client` and `Connection` pair.
 /// This is a crate-internal type; the public API will wrap it.
-pub(crate) struct ConnectResult<S> {
-    /// The framed stream ready for request/response messaging.
-    pub framed: Framed<S, CubridCodec>,
-    /// Updated CAS info from the handshake.
-    pub cas_info: CasInfo,
-    /// Broker capability information.
-    pub broker_info: BrokerInfo,
-    /// Server-assigned session ID.
-    pub session_id: [u8; DRIVER_SESSION_SIZE],
-    /// Detected server version.
-    pub version: CubridVersion,
-    /// SQL dialect capabilities based on the detected version.
-    pub dialect: CubridDialect,
-    /// Negotiated protocol version.
-    pub protocol_version: u8,
-    /// CAS process ID.
-    pub cas_pid: i32,
-    /// CAS index within the broker (V4+).
-    pub cas_id: i32,
-}
-
-// ---------------------------------------------------------------------------
-// Public connect function
-// ---------------------------------------------------------------------------
-
-/// Handshake results without the framed stream.
-///
-/// This contains all the session metadata from the handshake, suitable
-/// for constructing a `Client`.
-///
-/// # DNS rebinding risk
-///
-/// Multi-host retry iterates through resolved addresses sequentially. In
-/// adversarial environments, a DNS response could change between the
-/// broker port negotiation (phase 1) and the CAS authentication (phase 2)
-/// if the socket is closed and reopened. This is a theoretical risk in
-/// any multi-host TCP client; use static IP addresses or trusted DNS
-/// resolvers in security-sensitive deployments.
-#[derive(Debug, Clone)]
-pub(crate) struct HandshakeResult {
+pub(crate) struct ConnectResult {
     /// Updated CAS info from the handshake.
     pub cas_info: CasInfo,
     /// Broker capability information.
@@ -103,13 +65,26 @@ pub(crate) struct HandshakeResult {
     /// and monitoring use.
     #[allow(dead_code)]
     pub cas_id: i32,
+    /// The background connection (stream type erased).
+    pub connection: Connection,
+    /// Channel sender for dispatching requests to the connection.
+    pub sender: tokio::sync::mpsc::UnboundedSender<Request>,
 }
+
+// ---------------------------------------------------------------------------
+// Public connect function
+// ---------------------------------------------------------------------------
 
 /// Perform the full CUBRID handshake and return the connection components.
 ///
-/// Returns a tuple of `(HandshakeResult, Connection, UnboundedSender)`.
-/// The `Connection` must be spawned, and the `UnboundedSender` is used by
-/// the `Client` to send requests to the connection loop.
+/// Returns a [`ConnectResult`] containing the `Connection` (which must be
+/// spawned) and the `UnboundedSender` used by `Client` to send requests.
+///
+/// The `tls` parameter provides the TLS backend. Use [`NoTls`] for
+/// unencrypted connections (the CUBRID default) or a `MakeTlsConnect`
+/// implementation such as `cubrid-openssl` for encrypted connections.
+///
+/// [`NoTls`]: crate::tls::NoTls
 ///
 /// # Channel design (M5)
 ///
@@ -126,40 +101,24 @@ pub(crate) struct HandshakeResult {
 /// Switching to a bounded channel would require every `send_request` call
 /// to handle the "channel full" case, which is a significant API change.
 /// This is a known limitation documented here for future consideration.
-pub(crate) async fn do_connect(
+pub(crate) async fn do_connect<T>(
     config: &Config,
-) -> Result<
-    (
-        HandshakeResult,
-        Connection<TcpStream>,
-        tokio::sync::mpsc::UnboundedSender<Request>,
-    ),
-    Error,
-> {
+    mut tls: T,
+) -> Result<ConnectResult, Error>
+where
+    T: MakeTlsConnect<TcpStream>,
+{
     config.validate()?;
 
     let hosts = config.get_hosts();
     let mut last_error = None;
 
     for host in hosts {
-        match try_connect(config, host).await {
-            Ok(connect_result) => {
-                let handshake = HandshakeResult {
-                    cas_info: connect_result.cas_info,
-                    broker_info: connect_result.broker_info,
-                    session_id: connect_result.session_id,
-                    version: connect_result.version,
-                    dialect: connect_result.dialect,
-                    protocol_version: connect_result.protocol_version,
-                    cas_pid: connect_result.cas_pid,
-                    cas_id: connect_result.cas_id,
-                };
-
-                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                let connection = Connection::new(connect_result.framed, rx, connect_result.cas_info);
-
-                return Ok((handshake, connection, tx));
-            }
+        let tls_connect = tls
+            .make_tls_connect(host)
+            .map_err(|e| Error::Tls(e.into()))?;
+        match try_connect(config, host, tls_connect).await {
+            Ok(result) => return Ok(result),
             Err(e) => {
                 log::warn!("Failed to connect to {}:{}: {}", host, config.get_port(), e);
                 last_error = Some(e);
@@ -179,14 +138,22 @@ pub(crate) async fn do_connect(
 // ---------------------------------------------------------------------------
 
 /// Attempt to connect to a single host.
-async fn try_connect(config: &Config, host: &str) -> Result<ConnectResult<TcpStream>, Error> {
+async fn try_connect<T>(
+    config: &Config,
+    host: &str,
+    tls_connect: T,
+) -> Result<ConnectResult, Error>
+where
+    T: TlsConnect<TcpStream>,
+{
     let addr = format!("{}:{}", host, config.get_port());
+    let ssl_mode = config.get_ssl_mode();
 
     // Phase 1: Connect to broker port
     let mut stream = tcp_connect(&addr, config.get_connect_timeout()).await?;
 
     // Phase 1: Send client info exchange
-    let ssl = config.get_ssl_mode() != crate::tls::SslMode::Disable;
+    let ssl = ssl_mode != crate::tls::SslMode::Disable;
     let mut buf = BytesMut::new();
     write_client_info_exchange(config.get_protocol_version(), ssl, &mut buf);
     stream.write_all(&buf).await.map_err(Error::Io)?;
@@ -200,7 +167,7 @@ async fn try_connect(config: &Config, host: &str) -> Result<ConnectResult<TcpStr
     let broker_response = parse_broker_response(&port_buf).map_err(Error::Protocol)?;
 
     // If broker says reconnect to a new port, do so
-    let mut stream = match broker_response {
+    let stream = match broker_response {
         BrokerResponse::Reconnect(new_port) => {
             drop(stream);
             let new_addr = format!("{}:{}", host, new_port);
@@ -209,6 +176,75 @@ async fn try_connect(config: &Config, host: &str) -> Result<ConnectResult<TcpStr
         BrokerResponse::Reuse => stream,
     };
 
+    // TLS upgrade: after Phase 1, before Phase 2.
+    // The "CUBRS" magic has already signaled TLS intent to the broker.
+    // Now we perform the actual TLS handshake on the CAS connection.
+    match ssl_mode {
+        SslMode::Require => {
+            let tls_stream = tls_connect
+                .connect(stream)
+                .await
+                .map_err(|e| Error::Tls(e.into()))?;
+            finish_connect(config, MaybeTlsStream::Tls(tls_stream)).await
+        }
+        SslMode::Prefer => {
+            match tls_connect.connect(stream).await {
+                Ok(tls_stream) => {
+                    finish_connect(config, MaybeTlsStream::Tls(tls_stream)).await
+                }
+                Err(e) => {
+                    // TLS failed, fall back to plain TCP. The original stream
+                    // was consumed by the failed handshake, so we reconnect.
+                    log::warn!("TLS handshake failed, falling back to plain: {}", e.into());
+                    let new_stream = tcp_connect(&addr, config.get_connect_timeout()).await?;
+                    let plain = renegotiate_plain(config, host, new_stream).await?;
+                    // Use TcpStream as the dummy TLS type since we're falling
+                    // back to plain TCP and the Tls variant is never constructed.
+                    finish_connect::<TcpStream>(config, MaybeTlsStream::Raw(plain)).await
+                }
+            }
+        }
+        SslMode::Disable => {
+            finish_connect::<TcpStream>(config, MaybeTlsStream::Raw(stream)).await
+        }
+    }
+}
+
+/// Re-negotiate a plain (non-TLS) connection after a TLS fallback.
+///
+/// Used by `SslMode::Prefer` when TLS fails. Performs Phase 1 again
+/// without the SSL flag, then returns the CAS stream ready for Phase 2.
+async fn renegotiate_plain(
+    config: &Config,
+    host: &str,
+    mut stream: TcpStream,
+) -> Result<TcpStream, Error> {
+    let mut buf = BytesMut::new();
+    write_client_info_exchange(config.get_protocol_version(), false, &mut buf);
+    stream.write_all(&buf).await.map_err(Error::Io)?;
+
+    let mut port_buf = [0u8; 4];
+    stream.read_exact(&mut port_buf).await.map_err(Error::Io)?;
+    let broker_response = parse_broker_response(&port_buf).map_err(Error::Protocol)?;
+
+    match broker_response {
+        BrokerResponse::Reconnect(new_port) => {
+            drop(stream);
+            let new_addr = format!("{}:{}", host, new_port);
+            tcp_connect(&new_addr, config.get_connect_timeout()).await
+        }
+        BrokerResponse::Reuse => Ok(stream),
+    }
+}
+
+/// Complete Phase 2 and Phase 3 on a `MaybeTlsStream`.
+async fn finish_connect<T>(
+    config: &Config,
+    mut stream: MaybeTlsStream<TcpStream, T>,
+) -> Result<ConnectResult, Error>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     // Phase 2: Send open database credentials
     let mut buf = BytesMut::new();
     write_open_database(
@@ -250,8 +286,10 @@ async fn try_connect(config: &Config, host: &str) -> Result<ConnectResult<TcpStr
     // Wrap the stream in a Framed codec for subsequent request/response
     let framed = Framed::new(stream, CubridCodec::new());
 
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let connection = Connection::new(framed, rx, cas_info);
+
     Ok(ConnectResult {
-        framed,
         cas_info,
         broker_info: open_response.broker_info,
         session_id: open_response.session_id,
@@ -260,8 +298,11 @@ async fn try_connect(config: &Config, host: &str) -> Result<ConnectResult<TcpStr
         protocol_version,
         cas_pid: open_response.cas_pid,
         cas_id: open_response.cas_id,
+        connection,
+        sender: tx,
     })
 }
+
 
 /// Establish a TCP connection with optional timeout.
 async fn tcp_connect(
