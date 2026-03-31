@@ -1,0 +1,22 @@
+[package]
+name = "cubrid-rustls"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "TLS support for CUBRID via rustls (pure Rust, no OpenSSL dependency)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cubrid/cubrid-rs"
+keywords = ["cubrid", "database", "tls", "rustls"]
+categories = ["database"]
+readme = "../README.md"
+
+[dependencies]
+tokio-cubrid = { path = "../tokio-cubrid" }
+rustls = "0.23"
+tokio = "1"
+tokio-rustls = "0.26"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+rcgen = "0.13"
+rustls-pemfile = "2"

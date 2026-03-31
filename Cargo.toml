@@ -5,6 +5,7 @@ members = [
     "tokio-cubrid",
     "cubrid",
     "cubrid-openssl",
+    "cubrid-rustls",
     "cubrid-diesel",
 ]
 resolver = "2"

@@ -864,7 +864,7 @@ fn serialize_params(
 
     let mut buf = Vec::new();
 
-    for (i, param) in params.iter().enumerate() {
+    for (_i, param) in params.iter().enumerate() {
         // Always infer the parameter's native type via to_sql_checked
         // probing. We cannot reliably use PREPARE column metadata because
         // columns describe the RESULT SET, not the bind parameters —
