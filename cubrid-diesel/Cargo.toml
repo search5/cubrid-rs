@@ -1,0 +1,27 @@
+[package]
+name = "cubrid-diesel"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Diesel backend for CUBRID database"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cubrid/cubrid-rs"
+keywords = ["cubrid", "database", "diesel", "orm"]
+categories = ["database"]
+readme = "../README.md"
+
+[dependencies]
+cubrid = { path = "../cubrid" }
+cubrid-types = { path = "../cubrid-types" }
+cubrid-protocol = { path = "../cubrid-protocol" }
+tokio-cubrid = { path = "../tokio-cubrid" }
+diesel = { version = "2.2", default-features = false, features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
+bytes = "1"
+byteorder = "1"
+
+[features]
+default = []
+r2d2 = ["diesel/r2d2", "cubrid/with-r2d2"]
+
+[dev-dependencies]
+diesel = { version = "2.2", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }

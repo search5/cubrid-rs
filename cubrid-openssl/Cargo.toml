@@ -1,0 +1,14 @@
+[package]
+name = "cubrid-openssl"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "TLS support for CUBRID via OpenSSL"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cubrid/cubrid-rs"
+keywords = ["cubrid", "database", "tls", "openssl"]
+categories = ["database"]
+readme = "../README.md"
+
+[dependencies]
+tokio-cubrid = { path = "../tokio-cubrid" }

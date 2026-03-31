@@ -1,0 +1,23 @@
+[package]
+name = "cubrid"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Synchronous CUBRID client (wrapper over tokio-cubrid)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cubrid/cubrid-rs"
+keywords = ["cubrid", "database", "driver", "sync"]
+categories = ["database"]
+readme = "../README.md"
+
+[dependencies]
+tokio-cubrid = { path = "../tokio-cubrid" }
+cubrid-protocol = { path = "../cubrid-protocol" }
+cubrid-types = { path = "../cubrid-types" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+log = "0.4"
+r2d2 = { version = "0.8", optional = true }
+
+[features]
+default = []
+with-r2d2 = ["r2d2"]

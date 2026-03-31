@@ -1,0 +1,26 @@
+[package]
+name = "tokio-cubrid"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Asynchronous CUBRID client built on tokio"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cubrid/cubrid-rs"
+keywords = ["cubrid", "database", "driver", "async"]
+categories = ["database"]
+readme = "../README.md"
+
+[dependencies]
+cubrid-protocol = { path = "../cubrid-protocol" }
+cubrid-types = { path = "../cubrid-types" }
+bytes = "1"
+byteorder = "1"
+tokio = { version = "1", features = ["net", "io-util", "time", "rt", "sync", "macros"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures-util = { version = "0.3", features = ["sink"] }
+log = "0.4"
+parking_lot = "0.12"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

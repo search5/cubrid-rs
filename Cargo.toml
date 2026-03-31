@@ -1,0 +1,19 @@
+[workspace]
+members = [
+    "cubrid-protocol",
+    "cubrid-types",
+    "tokio-cubrid",
+    "cubrid",
+    "cubrid-openssl",
+    "cubrid-diesel",
+]
+resolver = "2"
+
+# Dependency version policy: We use semver-compatible ranges (e.g.,
+# `bytes = "1"`) without upper bounds. This is standard Rust practice
+# because Cargo's resolver respects semver and will not pick breaking
+# versions. Pinning exact versions would prevent dependents from
+# de-duplicating shared crates.
+
+[profile.release]
+debug = 2

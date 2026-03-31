@@ -1,0 +1,27 @@
+[package]
+name = "cubrid-types"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Rust type conversions for CUBRID database types"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cubrid/cubrid-rs"
+keywords = ["cubrid", "database", "driver", "types"]
+categories = ["database"]
+readme = "../README.md"
+
+[features]
+default = []
+with-chrono = ["chrono"]
+with-time = ["time"]
+with-serde-json = ["serde_json"]
+with-rust-decimal = ["rust_decimal"]
+
+[dependencies]
+cubrid-protocol = { path = "../cubrid-protocol" }
+bytes = "1"
+byteorder = "1"
+chrono = { version = "0.4", default-features = false, optional = true }
+time = { version = "0.3", default-features = false, features = ["macros"], optional = true }
+serde_json = { version = "1", optional = true }
+rust_decimal = { version = "1", optional = true }
