@@ -110,6 +110,14 @@ impl Client {
         self.inner().protocol_version()
     }
 
+    /// Returns the host:port that was successfully connected to.
+    ///
+    /// In an HA configuration with multiple hosts, this identifies which
+    /// broker the client is currently connected to.
+    pub fn active_host(&self) -> &str {
+        self.inner().active_host()
+    }
+
     /// Returns `true` if the background connection has been closed.
     pub fn is_closed(&self) -> bool {
         self.client.as_ref().map_or(true, |c| c.is_closed())

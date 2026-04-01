@@ -18,6 +18,7 @@
 //!    the SQL dialect capabilities.
 
 use bytes::{Buf, BytesMut};
+use rand::seq::SliceRandom;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
@@ -31,7 +32,7 @@ use cubrid_protocol::codec::CubridCodec;
 use cubrid_protocol::message::frontend;
 use cubrid_protocol::{DRIVER_SESSION_SIZE, NET_SIZE_CAS_INFO, NET_SIZE_INT};
 
-use crate::config::Config;
+use crate::config::{Config, Host};
 use crate::connection::{Connection, ReconnectInfo, Request};
 use crate::error::Error;
 use crate::tls::{MakeTlsConnect, MaybeTlsStream, SslMode, TlsConnect};
@@ -65,6 +66,8 @@ pub(crate) struct ConnectResult {
     /// and monitoring use.
     #[allow(dead_code)]
     pub cas_id: i32,
+    /// The host:port that was successfully connected to.
+    pub active_host: String,
     /// The background connection (stream type erased).
     pub connection: Connection,
     /// Channel sender for dispatching requests to the connection.
@@ -110,18 +113,35 @@ where
 {
     config.validate()?;
 
-    let hosts = config.get_hosts();
+    // Build the ordered host list, optionally shuffled for load balancing.
+    let mut hosts: Vec<Host> = config.get_hosts().to_vec();
+    if config.get_load_balance() {
+        let mut rng = rand::rng();
+        hosts.shuffle(&mut rng);
+    }
+
+    let default_port = config.get_port();
+    let max_retries = config.get_max_connection_retry_count();
     let mut last_error = None;
 
-    for host in hosts {
-        let tls_connect = tls
-            .make_tls_connect(host)
-            .map_err(|e| Error::Tls(e.into()))?;
-        match try_connect(config, host, tls_connect).await {
-            Ok(result) => return Ok(result),
-            Err(e) => {
-                log::warn!("Failed to connect to {}:{}: {}", host, config.get_port(), e);
-                last_error = Some(e);
+    // Try all hosts, then retry up to max_connection_retry_count times.
+    for attempt in 0..=max_retries {
+        if attempt > 0 {
+            log::info!("HA failover retry {}/{}", attempt, max_retries);
+        }
+
+        for host_entry in &hosts {
+            let hostname = host_entry.host();
+            let port = host_entry.effective_port(default_port);
+            let tls_connect = tls
+                .make_tls_connect(hostname)
+                .map_err(|e| Error::Tls(e.into()))?;
+            match try_connect(config, hostname, port, tls_connect).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    log::warn!("Failed to connect to {}:{}: {}", hostname, port, e);
+                    last_error = Some(e);
+                }
             }
         }
     }
@@ -137,16 +157,17 @@ where
 // Internal connection logic
 // ---------------------------------------------------------------------------
 
-/// Attempt to connect to a single host.
+/// Attempt to connect to a single host with a specific port.
 async fn try_connect<T>(
     config: &Config,
     host: &str,
+    port: u16,
     tls_connect: T,
 ) -> Result<ConnectResult, Error>
 where
     T: TlsConnect<TcpStream>,
 {
-    let addr = format!("{}:{}", host, config.get_port());
+    let addr = format!("{}:{}", host, port);
     let ssl_mode = config.get_ssl_mode();
 
     // Phase 1: Connect to broker port
@@ -176,6 +197,8 @@ where
         BrokerResponse::Reuse => stream,
     };
 
+    let active_host = format!("{}:{}", host, port);
+
     // TLS upgrade: after Phase 1, before Phase 2.
     // The "CUBRS" magic has already signaled TLS intent to the broker.
     // Now we perform the actual TLS handshake on the CAS connection.
@@ -185,27 +208,27 @@ where
                 .connect(stream)
                 .await
                 .map_err(|e| Error::Tls(e.into()))?;
-            finish_connect(config, MaybeTlsStream::Tls(tls_stream)).await
+            finish_connect(config, MaybeTlsStream::Tls(tls_stream), &active_host).await
         }
         SslMode::Prefer => {
             match tls_connect.connect(stream).await {
                 Ok(tls_stream) => {
-                    finish_connect(config, MaybeTlsStream::Tls(tls_stream)).await
+                    finish_connect(config, MaybeTlsStream::Tls(tls_stream), &active_host).await
                 }
                 Err(e) => {
                     // TLS failed, fall back to plain TCP. The original stream
                     // was consumed by the failed handshake, so we reconnect.
                     log::warn!("TLS handshake failed, falling back to plain: {}", e.into());
                     let new_stream = tcp_connect(&addr, config.get_connect_timeout()).await?;
-                    let plain = renegotiate_plain(config, host, new_stream).await?;
+                    let plain = renegotiate_plain(config, host, port, new_stream).await?;
                     // Use TcpStream as the dummy TLS type since we're falling
                     // back to plain TCP and the Tls variant is never constructed.
-                    finish_connect::<TcpStream>(config, MaybeTlsStream::Raw(plain)).await
+                    finish_connect::<TcpStream>(config, MaybeTlsStream::Raw(plain), &active_host).await
                 }
             }
         }
         SslMode::Disable => {
-            finish_connect::<TcpStream>(config, MaybeTlsStream::Raw(stream)).await
+            finish_connect::<TcpStream>(config, MaybeTlsStream::Raw(stream), &active_host).await
         }
     }
 }
@@ -217,6 +240,7 @@ where
 async fn renegotiate_plain(
     config: &Config,
     host: &str,
+    _port: u16,
     mut stream: TcpStream,
 ) -> Result<TcpStream, Error> {
     let mut buf = BytesMut::new();
@@ -241,6 +265,7 @@ async fn renegotiate_plain(
 async fn finish_connect<T>(
     config: &Config,
     mut stream: MaybeTlsStream<TcpStream, T>,
+    active_host: &str,
 ) -> Result<ConnectResult, Error>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -289,15 +314,21 @@ where
     // Wrap the stream in a Framed codec for subsequent request/response
     let framed = Framed::new(stream, CubridCodec::new());
 
-    // Store connection parameters for CAS reconnection under
-    // KEEP_CONNECTION=AUTO mode.
+    // Build the host list for reconnection: all configured hosts with their
+    // effective ports, so reconnection can try alternate hosts on failure.
+    let default_port = config.get_port();
+    let reconnect_hosts: Vec<(String, u16)> = config
+        .get_hosts()
+        .iter()
+        .map(|h| (h.host().to_string(), h.effective_port(default_port)))
+        .collect();
+
     let reconnect_info = ReconnectInfo {
-        host: config.get_hosts().first().map(|s| s.as_str()).unwrap_or("localhost").to_string(),
-        port: config.get_port(),
+        hosts: reconnect_hosts,
         dbname: config.get_dbname().to_string(),
         user: config.get_user().to_string(),
         password: config.get_password().to_string(),
-        protocol_version: protocol_version,
+        protocol_version,
     };
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -312,6 +343,7 @@ where
         protocol_version,
         cas_pid: open_response.cas_pid,
         cas_id: open_response.cas_id,
+        active_host: active_host.to_string(),
         connection,
         sender: tx,
     })

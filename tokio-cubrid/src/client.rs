@@ -121,6 +121,8 @@ pub struct Client {
     version: CubridVersion,
     dialect: CubridDialect,
     query_timeout_ms: i32,
+    /// The host:port that was successfully connected to.
+    active_host: String,
 }
 
 impl Client {
@@ -142,10 +144,11 @@ impl Client {
             version,
             dialect,
             query_timeout_ms: 0,
+            active_host: String::new(),
         }
     }
 
-    /// Create a new Client with a query timeout from config.
+    /// Create a new Client with connection metadata from config and handshake.
     ///
     /// This is called by the connect module after the handshake completes.
     pub(crate) fn new_with_config(
@@ -153,12 +156,14 @@ impl Client {
         version: CubridVersion,
         dialect: CubridDialect,
         config: &Config,
+        active_host: String,
     ) -> Self {
         Client {
             inner,
             version,
             dialect,
             query_timeout_ms: config.get_query_timeout_ms(),
+            active_host,
         }
     }
 
@@ -175,6 +180,14 @@ impl Client {
     /// Returns the negotiated wire protocol version.
     pub fn protocol_version(&self) -> u8 {
         self.inner.protocol_version
+    }
+
+    /// Returns the host:port that was successfully connected to.
+    ///
+    /// In an HA configuration with multiple hosts, this identifies which
+    /// broker the client is currently connected to.
+    pub fn active_host(&self) -> &str {
+        &self.active_host
     }
 
     /// Returns `true` if the background connection has been closed.
@@ -1084,7 +1097,8 @@ mod tests {
         let dialect = CubridDialect::from_version(&version);
         let mut config = Config::new();
         config.host("localhost").dbname("testdb").query_timeout(Duration::from_secs(5));
-        let client = Client::new_with_config(inner, version, dialect, &config);
+        let client = Client::new_with_config(inner, version, dialect, &config, "localhost:33000".to_string());
         assert_eq!(client.query_timeout_ms(), 5000);
+        assert_eq!(client.active_host(), "localhost:33000");
     }
 }

@@ -17,7 +17,7 @@ pub mod transaction;
 pub mod version;
 
 pub use client::Client;
-pub use config::Config;
+pub use config::{Config, Host};
 pub use connection::Connection;
 pub use error::Error;
 pub use row::Row;
@@ -101,7 +101,7 @@ where
         auto_commit: std::sync::atomic::AtomicBool::new(config.get_auto_commit()),
     });
 
-    let client = Client::new_with_config(inner, result.version, result.dialect, config);
+    let client = Client::new_with_config(inner, result.version, result.dialect, config, result.active_host);
 
     Ok((client, result.connection))
 }

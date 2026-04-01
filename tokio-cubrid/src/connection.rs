@@ -94,18 +94,15 @@ pub struct Request {
 
 /// Connection parameters needed for CAS reconnection.
 ///
-/// Stored by the connection so it can transparently reconnect when the CAS
-/// process closes the TCP socket under `KEEP_CONNECTION=AUTO`.
-/// Connection parameters needed for CAS reconnection.
+/// Stores all configured hosts so the reconnection logic can try alternate
+/// hosts when the primary is unavailable (HA failover on reconnect).
 ///
 /// Exposed as public for testing; not part of the stable API.
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct ReconnectInfo {
-    /// Broker host address.
-    pub host: String,
-    /// Broker port number.
-    pub port: u16,
+    /// All configured hosts with their effective ports, in priority order.
+    pub hosts: Vec<(String, u16)>,
     /// Database name.
     pub dbname: String,
     /// Database user name.
@@ -347,16 +344,38 @@ where
 
 /// Perform a full two-phase reconnection to the CAS.
 ///
-/// This mirrors the initial connection flow:
+/// Tries all configured hosts in order (HA failover). For each host:
 /// 1. Phase 1: broker port negotiation (client info exchange)
 /// 2. Phase 2: database authentication (open database)
+/// 3. Phase 3: version detection (GET_DB_VERSION)
 ///
-/// Returns the new stream and updated CAS info.
+/// Returns the new stream and updated CAS info on the first successful host.
 async fn reconnect(
     info: &ReconnectInfo,
     _cas_info: &CasInfo,
 ) -> Result<(MaybeTlsStream<TcpStream, TcpStream>, CasInfo), Error> {
-    let addr = format!("{}:{}", info.host, info.port);
+    let mut last_error = None;
+
+    for (host, port) in &info.hosts {
+        match reconnect_to_host(info, host, *port).await {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                log::warn!("CAS reconnection to {}:{} failed: {}", host, port, e);
+                last_error = Some(e);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or(Error::Closed))
+}
+
+/// Attempt reconnection to a single host.
+async fn reconnect_to_host(
+    info: &ReconnectInfo,
+    host: &str,
+    port: u16,
+) -> Result<(MaybeTlsStream<TcpStream, TcpStream>, CasInfo), Error> {
+    let addr = format!("{}:{}", host, port);
 
     // Phase 1: Connect to broker port
     let mut stream = TcpStream::connect(&addr).await.map_err(Error::Io)?;
@@ -375,7 +394,7 @@ async fn reconnect(
     let mut stream = match broker_response {
         BrokerResponse::Reconnect(new_port) => {
             drop(stream);
-            let new_addr = format!("{}:{}", info.host, new_port);
+            let new_addr = format!("{}:{}", host, new_port);
             TcpStream::connect(&new_addr).await.map_err(Error::Io)?
         }
         BrokerResponse::Reuse => stream,
@@ -448,7 +467,7 @@ async fn reconnect(
     cas_info_bytes.copy_from_slice(&body[..4]);
     let new_cas_info = CasInfo::from_bytes(cas_info_bytes);
 
-    log::debug!("CAS reconnection successful");
+    log::debug!("CAS reconnection to {}:{} successful", host, port);
 
     Ok((MaybeTlsStream::Raw(stream), new_cas_info))
 }

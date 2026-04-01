@@ -20,6 +20,7 @@ tokio-util = { version = "0.7", features = ["codec"] }
 futures-util = { version = "0.3", features = ["sink"] }
 log = "0.4"
 parking_lot = "0.12"
+rand = "0.9"
 thiserror = "2"
 
 [dev-dependencies]

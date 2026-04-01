@@ -16,6 +16,31 @@
 //! cubrid://user:password@host:port/dbname
 //! ```
 //!
+//! # HA (High Availability) support
+//!
+//! Multiple hosts can be configured for automatic failover. The driver tries
+//! each host in order (or in random order when `load_balance` is enabled).
+//!
+//! Connection string with `altHosts`:
+//! ```text
+//! cubrid:primary:33000:demodb:dba::?altHosts=standby1:33000,standby2:33000
+//! cubrid://dba@primary:33000/demodb?altHosts=standby1:33000,standby2:33000&loadBalance=true
+//! ```
+//!
+//! Builder pattern:
+//! ```
+//! use tokio_cubrid::Config;
+//!
+//! let mut config = Config::new();
+//! config
+//!     .host("primary")
+//!     .host_with_port("standby1", 33000)
+//!     .host_with_port("standby2", 33100)
+//!     .port(33000)
+//!     .dbname("demodb")
+//!     .load_balance(true);
+//! ```
+//!
 //! # Examples
 //!
 //! ```
@@ -46,6 +71,148 @@ pub const DEFAULT_PORT: u16 = 33000;
 /// Default user name.
 pub const DEFAULT_USER: &str = "dba";
 
+/// Default reconnection interval to the primary host (10 minutes).
+pub const DEFAULT_RC_TIME: Duration = Duration::from_secs(600);
+
+/// Default maximum connection retry count.
+pub const DEFAULT_MAX_RETRY_COUNT: u32 = 1;
+
+// ---------------------------------------------------------------------------
+// Host
+// ---------------------------------------------------------------------------
+
+/// A host entry with an optional per-host port override.
+///
+/// When `port` is `None`, the global [`Config::get_port()`] default is used.
+/// This enables CUBRID HA configurations where brokers may run on different
+/// ports.
+///
+/// # Examples
+///
+/// ```
+/// use tokio_cubrid::config::Host;
+///
+/// let h1 = Host::new("primary");
+/// assert_eq!(h1.host(), "primary");
+/// assert_eq!(h1.port(), None);
+///
+/// let h2 = Host::with_port("standby", 33100);
+/// assert_eq!(h2.port(), Some(33100));
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Host {
+    host: String,
+    port: Option<u16>,
+}
+
+impl Host {
+    /// Create a host entry using the global default port.
+    pub fn new(host: &str) -> Self {
+        Self {
+            host: host.to_string(),
+            port: None,
+        }
+    }
+
+    /// Create a host entry with a specific port override.
+    pub fn with_port(host: &str, port: u16) -> Self {
+        Self {
+            host: host.to_string(),
+            port: Some(port),
+        }
+    }
+
+    /// Returns the hostname.
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// Returns the per-host port override, or `None` for the global default.
+    pub fn port(&self) -> Option<u16> {
+        self.port
+    }
+
+    /// Returns the effective port: per-host override or the given default.
+    pub fn effective_port(&self, default_port: u16) -> u16 {
+        self.port.unwrap_or(default_port)
+    }
+}
+
+impl std::fmt::Display for Host {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.port {
+            Some(p) => write!(f, "{}:{}", self.host, p),
+            None => write!(f, "{}", self.host),
+        }
+    }
+}
+
+/// Allow comparing `Host` with `&str` by hostname for convenience.
+///
+/// Only matches the hostname; ignores the port. This keeps existing code
+/// and tests that compare `config.get_hosts()[0] == "localhost"` working.
+impl PartialEq<&str> for Host {
+    fn eq(&self, other: &&str) -> bool {
+        self.host == *other
+    }
+}
+
+impl PartialEq<str> for Host {
+    fn eq(&self, other: &str) -> bool {
+        self.host == other
+    }
+}
+
+/// Parse a `"host:port"` or `"host"` string into a [`Host`].
+fn parse_host_port(s: &str) -> Result<Host, Error> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(Error::Config("host must not be empty".to_string()));
+    }
+
+    // IPv6 bracket notation: [addr]:port
+    if s.starts_with('[') {
+        if let Some(bracket_end) = s.find(']') {
+            let host = &s[1..bracket_end];
+            if host.is_empty() {
+                return Err(Error::Config("host must not be empty".to_string()));
+            }
+            let after = &s[bracket_end + 1..];
+            if let Some(port_str) = after.strip_prefix(':') {
+                if port_str.is_empty() {
+                    return Ok(Host::new(host));
+                }
+                let port: u16 = port_str
+                    .parse()
+                    .map_err(|e| Error::Config(format!("invalid port '{}': {}", port_str, e)))?;
+                return Ok(Host::with_port(host, port));
+            }
+            return Ok(Host::new(host));
+        }
+        return Err(Error::Config(
+            "missing closing bracket in IPv6 address".to_string(),
+        ));
+    }
+
+    // Regular host:port or just host
+    if let Some(colon_pos) = s.rfind(':') {
+        let host = &s[..colon_pos];
+        let port_str = &s[colon_pos + 1..];
+        if host.is_empty() {
+            return Err(Error::Config("host must not be empty".to_string()));
+        }
+        if port_str.is_empty() {
+            return Ok(Host::new(host));
+        }
+        let port: u16 = port_str
+            .parse()
+            .map_err(|e| Error::Config(format!("invalid port '{}': {}", port_str, e)))?;
+        Ok(Host::with_port(host, port))
+    } else {
+        Ok(Host::new(s))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
@@ -53,7 +220,8 @@ pub const DEFAULT_USER: &str = "dba";
 /// Configuration for connecting to a CUBRID database.
 ///
 /// Use the builder methods to set connection parameters. Multiple hosts can be
-/// added for HA failover; the driver will try them in order.
+/// added for HA failover; the driver will try them in order (or randomly when
+/// `load_balance` is enabled).
 ///
 /// # Examples
 ///
@@ -69,6 +237,16 @@ pub const DEFAULT_USER: &str = "dba";
 ///     .dbname("demodb");
 /// ```
 ///
+/// # HA failover
+///
+/// ```
+/// use tokio_cubrid::Config;
+///
+/// let config: Config = "cubrid://dba@primary:33000/demodb?altHosts=standby1:33000,standby2:33100&loadBalance=true".parse().unwrap();
+/// assert_eq!(config.get_hosts().len(), 3);
+/// assert!(config.get_load_balance());
+/// ```
+///
 /// # Security
 ///
 /// The password is sent in plaintext over the wire unless TLS is enabled
@@ -76,7 +254,7 @@ pub const DEFAULT_USER: &str = "dba";
 /// credentials in transit.
 #[derive(Clone)]
 pub struct Config {
-    hosts: Vec<String>,
+    hosts: Vec<Host>,
     port: u16,
     user: String,
     password: String,
@@ -86,6 +264,15 @@ pub struct Config {
     auto_commit: bool,
     protocol_version: u8,
     ssl_mode: SslMode,
+    /// When `true`, connection attempts are made in random order across all
+    /// hosts. Distributes client connections across multiple HA brokers.
+    load_balance: bool,
+    /// Interval to retry connection to the primary (first) host after
+    /// failover to an alternate host. Default: 600 seconds (10 minutes).
+    rc_time: Duration,
+    /// Number of times to retry the full host list after exhausting all
+    /// hosts in a single pass. Default: 1.
+    max_connection_retry_count: u32,
 }
 
 impl std::fmt::Debug for Config {
@@ -101,6 +288,9 @@ impl std::fmt::Debug for Config {
             .field("auto_commit", &self.auto_commit)
             .field("protocol_version", &self.protocol_version)
             .field("ssl_mode", &self.ssl_mode)
+            .field("load_balance", &self.load_balance)
+            .field("rc_time", &self.rc_time)
+            .field("max_connection_retry_count", &self.max_connection_retry_count)
             .finish()
     }
 }
@@ -116,6 +306,9 @@ impl Config {
     /// - protocol_version: [`cubrid_protocol::DEFAULT_PROTOCOL_VERSION`]
     /// - ssl_mode: [`SslMode::Disable`]
     /// - query_timeout: `None` (no timeout)
+    /// - load_balance: `false`
+    /// - rc_time: 600 seconds
+    /// - max_connection_retry_count: 1
     pub fn new() -> Self {
         Self {
             hosts: Vec::new(),
@@ -128,19 +321,31 @@ impl Config {
             auto_commit: true,
             protocol_version: cubrid_protocol::DEFAULT_PROTOCOL_VERSION,
             ssl_mode: SslMode::Disable,
+            load_balance: false,
+            rc_time: DEFAULT_RC_TIME,
+            max_connection_retry_count: DEFAULT_MAX_RETRY_COUNT,
         }
     }
 
-    /// Add a host to the connection host list.
+    /// Add a host to the connection host list using the global default port.
     ///
     /// Multiple hosts can be added for HA failover. The driver tries them in
-    /// the order they were added.
+    /// the order they were added (or randomly if `load_balance` is enabled).
     pub fn host(&mut self, host: &str) -> &mut Self {
-        self.hosts.push(host.to_string());
+        self.hosts.push(Host::new(host));
         self
     }
 
-    /// Set the broker port (default: 33000).
+    /// Add a host with a specific port override for HA configurations where
+    /// brokers run on different ports.
+    pub fn host_with_port(&mut self, host: &str, port: u16) -> &mut Self {
+        self.hosts.push(Host::with_port(host, port));
+        self
+    }
+
+    /// Set the default broker port (default: 33000).
+    ///
+    /// This port is used for hosts that do not have a per-host port override.
     pub fn port(&mut self, port: u16) -> &mut Self {
         self.port = port;
         self
@@ -203,16 +408,46 @@ impl Config {
         self
     }
 
+    /// Enable or disable load balancing across hosts (default: `false`).
+    ///
+    /// When enabled, the driver shuffles the host list randomly before each
+    /// connection attempt. This distributes client connections across multiple
+    /// HA brokers instead of always preferring the primary.
+    pub fn load_balance(&mut self, enabled: bool) -> &mut Self {
+        self.load_balance = enabled;
+        self
+    }
+
+    /// Set the reconnection interval to the primary host (default: 600s).
+    ///
+    /// After failing over to an alternate host, the driver records when the
+    /// failover occurred. On subsequent reconnections, if `rc_time` has
+    /// elapsed, it will try the primary host again before alternates.
+    pub fn rc_time(&mut self, duration: Duration) -> &mut Self {
+        self.rc_time = duration;
+        self
+    }
+
+    /// Set the maximum number of retry passes over the full host list
+    /// (default: 1).
+    ///
+    /// After trying all hosts once, the driver retries up to this many
+    /// additional times. Set to 0 to disable retries (try each host once).
+    pub fn max_connection_retry_count(&mut self, count: u32) -> &mut Self {
+        self.max_connection_retry_count = count;
+        self
+    }
+
     // -----------------------------------------------------------------------
     // Getters
     // -----------------------------------------------------------------------
 
     /// Returns the list of configured hosts.
-    pub fn get_hosts(&self) -> &[String] {
+    pub fn get_hosts(&self) -> &[Host] {
         &self.hosts
     }
 
-    /// Returns the configured broker port.
+    /// Returns the configured default broker port.
     pub fn get_port(&self) -> u16 {
         self.port
     }
@@ -266,6 +501,21 @@ impl Config {
         self.ssl_mode
     }
 
+    /// Returns `true` if load balancing is enabled.
+    pub fn get_load_balance(&self) -> bool {
+        self.load_balance
+    }
+
+    /// Returns the reconnection interval to the primary host.
+    pub fn get_rc_time(&self) -> Duration {
+        self.rc_time
+    }
+
+    /// Returns the maximum connection retry count.
+    pub fn get_max_connection_retry_count(&self) -> u32 {
+        self.max_connection_retry_count
+    }
+
     // -----------------------------------------------------------------------
     // Validation
     // -----------------------------------------------------------------------
@@ -311,6 +561,12 @@ impl FromStr for Config {
     ///
     /// 1. CUBRID standard: `cubrid:host:port:dbname:user:password:`
     /// 2. URL format: `cubrid://user:password@host:port/dbname`
+    ///
+    /// Both formats support query parameters for HA configuration:
+    /// - `altHosts=host2:port2,host3:port3` — alternate hosts for failover
+    /// - `loadBalance=true` — randomize host order
+    /// - `rcTime=600` — reconnection interval to primary (seconds)
+    /// - `maxRetryCount=3` — max retry passes over the host list
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
 
@@ -327,13 +583,84 @@ impl FromStr for Config {
     }
 }
 
-/// Parse the colon-delimited format: `cubrid:host:port:dbname:user:password:`
+/// Apply query parameters (`altHosts`, `loadBalance`, `rcTime`, `maxRetryCount`)
+/// to a Config.
+fn apply_query_params(config: &mut Config, query: &str) -> Result<(), Error> {
+    for param in query.split('&') {
+        let param = param.trim();
+        if param.is_empty() {
+            continue;
+        }
+        let (key, value) = param
+            .split_once('=')
+            .ok_or_else(|| Error::Config(format!("invalid query parameter: '{}'", param)))?;
+
+        match key {
+            "altHosts" | "althosts" | "alt_hosts" => {
+                for host_str in value.split(',') {
+                    let host = parse_host_port(host_str)?;
+                    config.hosts.push(host);
+                }
+            }
+            "loadBalance" | "loadbalance" | "load_balance" => {
+                config.load_balance = value
+                    .parse::<bool>()
+                    .or_else(|_| match value {
+                        "1" => Ok(true),
+                        "0" => Ok(false),
+                        _ => Err(()),
+                    })
+                    .map_err(|_| {
+                        Error::Config(format!("invalid loadBalance value: '{}'", value))
+                    })?;
+            }
+            "rcTime" | "rctime" | "rc_time" => {
+                let secs: u64 = value.parse().map_err(|e| {
+                    Error::Config(format!("invalid rcTime '{}': {}", value, e))
+                })?;
+                config.rc_time = Duration::from_secs(secs);
+            }
+            "maxRetryCount" | "maxretrycount" | "max_retry_count" => {
+                let count: u32 = value.parse().map_err(|e| {
+                    Error::Config(format!("invalid maxRetryCount '{}': {}", value, e))
+                })?;
+                config.max_connection_retry_count = count;
+            }
+            "connectTimeout" | "connect_timeout" => {
+                let ms: u64 = value.parse().map_err(|e| {
+                    Error::Config(format!("invalid connectTimeout '{}': {}", value, e))
+                })?;
+                config.connect_timeout = Some(Duration::from_millis(ms));
+            }
+            "queryTimeout" | "query_timeout" => {
+                let ms: u64 = value.parse().map_err(|e| {
+                    Error::Config(format!("invalid queryTimeout '{}': {}", value, e))
+                })?;
+                config.query_timeout = Some(Duration::from_millis(ms));
+            }
+            _ => {
+                // Ignore unknown parameters for forward compatibility.
+                log::debug!("ignoring unknown connection parameter: {}={}", key, value);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parse the colon-delimited format: `cubrid:host:port:dbname:user:password:[?params]`
 fn parse_colon_delimited(s: &str) -> Result<Config, Error> {
-    // Strip the trailing colon if present, then split.
     let body = s.strip_prefix("cubrid:").unwrap_or(s);
+
+    // Split off query parameters if present.
+    let (main_part, query) = if let Some(q_pos) = body.find('?') {
+        (&body[..q_pos], Some(&body[q_pos + 1..]))
+    } else {
+        (body, None)
+    };
+
     // The format has a trailing colon, so after splitting we may get an empty
     // last element. We collect all parts and ignore trailing empties.
-    let parts: Vec<&str> = body.split(':').collect();
+    let parts: Vec<&str> = main_part.split(':').collect();
 
     // We expect at least 5 fields: host, port, dbname, user, password
     // The trailing colon produces an extra empty element.
@@ -371,10 +698,15 @@ fn parse_colon_delimited(s: &str) -> Result<Config, Error> {
     // Password can be empty (that is valid for CUBRID).
     config.password(password);
 
+    // Apply query parameters (altHosts, loadBalance, etc.)
+    if let Some(q) = query {
+        apply_query_params(&mut config, q)?;
+    }
+
     Ok(config.clone())
 }
 
-/// Parse the URL format: `cubrid://user:password@host:port/dbname`
+/// Parse the URL format: `cubrid://user:password@host:port/dbname[?params]`
 fn parse_url(s: &str) -> Result<Config, Error> {
     let rest = s
         .strip_prefix("cubrid://")
@@ -404,14 +736,21 @@ fn parse_url(s: &str) -> Result<Config, Error> {
         }
     }
 
+    // Split off query parameters if present.
+    let (host_and_db_main, query) = if let Some(q_pos) = host_and_db.find('?') {
+        (&host_and_db[..q_pos], Some(&host_and_db[q_pos + 1..]))
+    } else {
+        (host_and_db, None)
+    };
+
     // Parse host_and_db: "host:port/dbname" or "host/dbname" or "host:port"
-    let (host_port, dbname) = if let Some(slash_pos) = host_and_db.find('/') {
+    let (host_port, dbname) = if let Some(slash_pos) = host_and_db_main.find('/') {
         (
-            &host_and_db[..slash_pos],
-            &host_and_db[slash_pos + 1..],
+            &host_and_db_main[..slash_pos],
+            &host_and_db_main[slash_pos + 1..],
         )
     } else {
-        (host_and_db, "")
+        (host_and_db_main, "")
     };
 
     if !dbname.is_empty() {
@@ -463,6 +802,11 @@ fn parse_url(s: &str) -> Result<Config, Error> {
         }
     } else if !host_port.is_empty() {
         config.host(host_port);
+    }
+
+    // Apply query parameters (altHosts, loadBalance, etc.)
+    if let Some(q) = query {
+        apply_query_params(&mut config, q)?;
     }
 
     Ok(config.clone())
@@ -544,6 +888,148 @@ mod tests {
         assert_eq!(config.get_hosts()[0], "primary.example.com");
         assert_eq!(config.get_hosts()[1], "standby1.example.com");
         assert_eq!(config.get_hosts()[2], "standby2.example.com");
+    }
+
+    #[test]
+    fn test_host_with_port() {
+        let mut config = Config::new();
+        config
+            .host("primary")
+            .host_with_port("standby1", 33100)
+            .host_with_port("standby2", 33200)
+            .port(33000)
+            .dbname("demodb");
+
+        assert_eq!(config.get_hosts().len(), 3);
+        assert_eq!(config.get_hosts()[0].port(), None);
+        assert_eq!(config.get_hosts()[0].effective_port(33000), 33000);
+        assert_eq!(config.get_hosts()[1].port(), Some(33100));
+        assert_eq!(config.get_hosts()[1].effective_port(33000), 33100);
+        assert_eq!(config.get_hosts()[2].effective_port(33000), 33200);
+    }
+
+    // -----------------------------------------------------------------------
+    // HA configuration
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ha_defaults() {
+        let c = Config::new();
+        assert!(!c.get_load_balance());
+        assert_eq!(c.get_rc_time(), Duration::from_secs(600));
+        assert_eq!(c.get_max_connection_retry_count(), 1);
+    }
+
+    #[test]
+    fn test_ha_builder() {
+        let mut c = Config::new();
+        c.load_balance(true)
+            .rc_time(Duration::from_secs(300))
+            .max_connection_retry_count(5);
+
+        assert!(c.get_load_balance());
+        assert_eq!(c.get_rc_time(), Duration::from_secs(300));
+        assert_eq!(c.get_max_connection_retry_count(), 5);
+    }
+
+    #[test]
+    fn test_parse_url_with_alt_hosts() {
+        let config: Config =
+            "cubrid://dba@primary:33000/demodb?altHosts=standby1:33100,standby2:33200"
+                .parse()
+                .unwrap();
+        assert_eq!(config.get_hosts().len(), 3);
+        assert_eq!(config.get_hosts()[0], "primary");
+        assert_eq!(config.get_hosts()[1], "standby1");
+        assert_eq!(config.get_hosts()[1].port(), Some(33100));
+        assert_eq!(config.get_hosts()[2], "standby2");
+        assert_eq!(config.get_hosts()[2].port(), Some(33200));
+    }
+
+    #[test]
+    fn test_parse_url_with_all_ha_params() {
+        let config: Config =
+            "cubrid://dba@primary:33000/demodb?altHosts=standby1:33000&loadBalance=true&rcTime=120&maxRetryCount=3"
+                .parse()
+                .unwrap();
+        assert_eq!(config.get_hosts().len(), 2);
+        assert!(config.get_load_balance());
+        assert_eq!(config.get_rc_time(), Duration::from_secs(120));
+        assert_eq!(config.get_max_connection_retry_count(), 3);
+    }
+
+    #[test]
+    fn test_parse_colon_with_alt_hosts() {
+        let config: Config =
+            "cubrid:primary:33000:demodb:dba::?altHosts=standby1:33100,standby2"
+                .parse()
+                .unwrap();
+        assert_eq!(config.get_hosts().len(), 3);
+        assert_eq!(config.get_hosts()[0], "primary");
+        assert_eq!(config.get_hosts()[1], "standby1");
+        assert_eq!(config.get_hosts()[1].port(), Some(33100));
+        assert_eq!(config.get_hosts()[2], "standby2");
+        assert_eq!(config.get_hosts()[2].port(), None);
+    }
+
+    #[test]
+    fn test_parse_alt_hosts_no_port() {
+        let config: Config =
+            "cubrid://dba@primary:33000/demodb?altHosts=standby1,standby2"
+                .parse()
+                .unwrap();
+        assert_eq!(config.get_hosts().len(), 3);
+        assert_eq!(config.get_hosts()[1].port(), None);
+        assert_eq!(config.get_hosts()[2].port(), None);
+    }
+
+    #[test]
+    fn test_parse_load_balance_variants() {
+        let c1: Config = "cubrid://dba@h:33000/db?loadBalance=true".parse().unwrap();
+        assert!(c1.get_load_balance());
+
+        let c2: Config = "cubrid://dba@h:33000/db?loadbalance=1".parse().unwrap();
+        assert!(c2.get_load_balance());
+
+        let c3: Config = "cubrid://dba@h:33000/db?load_balance=false".parse().unwrap();
+        assert!(!c3.get_load_balance());
+    }
+
+    #[test]
+    fn test_parse_invalid_load_balance() {
+        let err: Result<Config, _> = "cubrid://dba@h:33000/db?loadBalance=maybe".parse();
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("loadBalance"));
+    }
+
+    #[test]
+    fn test_parse_connect_timeout_param() {
+        let config: Config =
+            "cubrid://dba@host:33000/db?connectTimeout=5000".parse().unwrap();
+        assert_eq!(config.get_connect_timeout(), Some(Duration::from_millis(5000)));
+    }
+
+    #[test]
+    fn test_parse_query_timeout_param() {
+        let config: Config =
+            "cubrid://dba@host:33000/db?queryTimeout=30000".parse().unwrap();
+        assert_eq!(config.get_query_timeout(), Some(Duration::from_millis(30000)));
+    }
+
+    #[test]
+    fn test_host_display() {
+        let h1 = Host::new("localhost");
+        assert_eq!(h1.to_string(), "localhost");
+
+        let h2 = Host::with_port("standby", 33100);
+        assert_eq!(h2.to_string(), "standby:33100");
+    }
+
+    #[test]
+    fn test_host_partial_eq_str() {
+        let h = Host::new("myhost");
+        assert_eq!(h, "myhost");
+        assert_ne!(h, "other");
     }
 
     // -----------------------------------------------------------------------
