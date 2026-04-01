@@ -96,19 +96,27 @@ pub fn short_from_sql(raw: &[u8]) -> Result<i16, Box<dyn Error + Sync + Send>> {
 }
 
 /// Decode a 32-bit signed integer from big-endian bytes.
+///
+/// Supports widening conversion from SHORT (2 bytes).
 pub fn int_from_sql(raw: &[u8]) -> Result<i32, Box<dyn Error + Sync + Send>> {
-    if raw.len() < 4 {
-        return Err(format!("expected 4 bytes for INT, got {}", raw.len()).into());
+    match raw.len() {
+        4.. => Ok((&raw[..4]).get_i32()),
+        2..=3 => Ok((&raw[..2]).get_i16() as i32),
+        _ => Err(format!("expected at least 2 bytes for INT, got {}", raw.len()).into()),
     }
-    Ok((&raw[..4]).get_i32())
 }
 
 /// Decode a 64-bit signed integer from big-endian bytes.
+///
+/// Supports widening conversion from smaller integer types (2 or 4 bytes)
+/// to handle version differences (e.g., CUBRID 10.2 returns COUNT(*) as INT).
 pub fn bigint_from_sql(raw: &[u8]) -> Result<i64, Box<dyn Error + Sync + Send>> {
-    if raw.len() < 8 {
-        return Err(format!("expected 8 bytes for BIGINT, got {}", raw.len()).into());
+    match raw.len() {
+        8.. => Ok((&raw[..8]).get_i64()),
+        4..=7 => Ok((&raw[..4]).get_i32() as i64),
+        2..=3 => Ok((&raw[..2]).get_i16() as i64),
+        _ => Err(format!("expected at least 2 bytes for BIGINT, got {}", raw.len()).into()),
     }
-    Ok((&raw[..8]).get_i64())
 }
 
 /// Decode a 16-bit unsigned integer from big-endian bytes.
@@ -120,19 +128,26 @@ pub fn ushort_from_sql(raw: &[u8]) -> Result<u16, Box<dyn Error + Sync + Send>> 
 }
 
 /// Decode a 32-bit unsigned integer from big-endian bytes.
+///
+/// Supports widening conversion from USHORT (2 bytes).
 pub fn uint_from_sql(raw: &[u8]) -> Result<u32, Box<dyn Error + Sync + Send>> {
-    if raw.len() < 4 {
-        return Err(format!("expected 4 bytes for UINT, got {}", raw.len()).into());
+    match raw.len() {
+        4.. => Ok((&raw[..4]).get_u32()),
+        2..=3 => Ok((&raw[..2]).get_u16() as u32),
+        _ => Err(format!("expected at least 2 bytes for UINT, got {}", raw.len()).into()),
     }
-    Ok((&raw[..4]).get_u32())
 }
 
 /// Decode a 64-bit unsigned integer from big-endian bytes.
+///
+/// Supports widening conversion from smaller unsigned types (2 or 4 bytes).
 pub fn ubigint_from_sql(raw: &[u8]) -> Result<u64, Box<dyn Error + Sync + Send>> {
-    if raw.len() < 8 {
-        return Err(format!("expected 8 bytes for UBIGINT, got {}", raw.len()).into());
+    match raw.len() {
+        8.. => Ok((&raw[..8]).get_u64()),
+        4..=7 => Ok((&raw[..4]).get_u32() as u64),
+        2..=3 => Ok((&raw[..2]).get_u16() as u64),
+        _ => Err(format!("expected at least 2 bytes for UBIGINT, got {}", raw.len()).into()),
     }
-    Ok((&raw[..8]).get_u64())
 }
 
 /// Decode a 32-bit IEEE 754 float from big-endian bytes.
@@ -276,7 +291,10 @@ mod tests {
 
     #[test]
     fn test_int_from_sql_too_short() {
-        assert!(int_from_sql(&[0, 0]).is_err());
+        // 2 bytes now succeeds (widening from SHORT)
+        assert!(int_from_sql(&[0, 0]).is_ok());
+        // 1 byte should still fail
+        assert!(int_from_sql(&[0]).is_err());
     }
 
     #[test]
@@ -287,7 +305,12 @@ mod tests {
 
     #[test]
     fn test_bigint_from_sql_too_short() {
-        assert!(bigint_from_sql(&[0; 4]).is_err());
+        // 4 bytes now succeeds (widening from INT)
+        assert!(bigint_from_sql(&[0; 4]).is_ok());
+        // 2 bytes also succeeds (widening from SHORT)
+        assert!(bigint_from_sql(&[0; 2]).is_ok());
+        // 1 byte should still fail
+        assert!(bigint_from_sql(&[0]).is_err());
     }
 
     #[test]

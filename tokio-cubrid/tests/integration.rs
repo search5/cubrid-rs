@@ -1923,8 +1923,13 @@ fn make_tls_connector() -> cubrid_openssl::MakeTlsConnector {
 
 /// Connect with SslMode::Require to the TLS broker port.
 /// Exercises lines 183-188 in connect.rs.
+/// Skipped unless CUBRID_TEST_TLS_PORT is set (requires TLS-enabled broker).
 #[tokio::test]
 async fn test_tls_require() {
+    if std::env::var("CUBRID_TEST_TLS_PORT").is_err() {
+        eprintln!("Skipping test_tls_require: CUBRID_TEST_TLS_PORT not set");
+        return;
+    }
     let config = tls_config(tokio_cubrid::SslMode::Require);
     let connector = make_tls_connector();
 
@@ -1947,8 +1952,13 @@ async fn test_tls_require() {
 /// Connect with SslMode::Prefer to the TLS broker port.
 /// The broker supports TLS, so the connection should succeed with TLS.
 /// Exercises lines 190-194 in connect.rs (Prefer success path).
+/// Skipped unless CUBRID_TEST_TLS_PORT is set (requires TLS-enabled broker).
 #[tokio::test]
 async fn test_tls_prefer_with_tls_broker() {
+    if std::env::var("CUBRID_TEST_TLS_PORT").is_err() {
+        eprintln!("Skipping test_tls_prefer_with_tls_broker: CUBRID_TEST_TLS_PORT not set");
+        return;
+    }
     let config = tls_config(tokio_cubrid::SslMode::Prefer);
     let connector = make_tls_connector();
 

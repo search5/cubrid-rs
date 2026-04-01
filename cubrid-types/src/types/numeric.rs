@@ -73,10 +73,10 @@ impl_to_sql_numeric!(i16, short_to_sql, Short);
 impl_from_sql_numeric!(i16, short_from_sql, Short);
 
 impl_to_sql_numeric!(i32, int_to_sql, Int);
-impl_from_sql_numeric!(i32, int_from_sql, Int);
+impl_from_sql_numeric!(i32, int_from_sql, Int, Short);
 
 impl_to_sql_numeric!(i64, bigint_to_sql, BigInt);
-impl_from_sql_numeric!(i64, bigint_from_sql, BigInt);
+impl_from_sql_numeric!(i64, bigint_from_sql, BigInt, Int, Short);
 
 // ---------------------------------------------------------------------------
 // Unsigned integer implementations (CUBRID 10.0+, PROTOCOL_V6)
@@ -86,10 +86,10 @@ impl_to_sql_numeric!(u16, ushort_to_sql, UShort);
 impl_from_sql_numeric!(u16, ushort_from_sql, UShort);
 
 impl_to_sql_numeric!(u32, uint_to_sql, UInt);
-impl_from_sql_numeric!(u32, uint_from_sql, UInt);
+impl_from_sql_numeric!(u32, uint_from_sql, UInt, UShort);
 
 impl_to_sql_numeric!(u64, ubigint_to_sql, UBigInt);
-impl_from_sql_numeric!(u64, ubigint_from_sql, UBigInt);
+impl_from_sql_numeric!(u64, ubigint_from_sql, UBigInt, UInt, UShort);
 
 // ---------------------------------------------------------------------------
 // Floating-point implementations
@@ -452,11 +452,15 @@ mod tests {
     #[test]
     fn test_from_sql_truncated_data() {
         assert!(i16::from_sql(&Type::SHORT, &[0]).is_err());
-        assert!(i32::from_sql(&Type::INT, &[0, 0]).is_err());
-        assert!(i64::from_sql(&Type::BIGINT, &[0; 4]).is_err());
+        assert!(i32::from_sql(&Type::INT, &[0]).is_err());
+        // 4 bytes → i64 widening should succeed (INT → BIGINT)
+        assert!(i64::from_sql(&Type::BIGINT, &[0; 4]).is_ok());
+        assert!(i64::from_sql(&Type::BIGINT, &[0]).is_err());
         assert!(u16::from_sql(&Type::USHORT, &[0]).is_err());
-        assert!(u32::from_sql(&Type::UINT, &[0, 0]).is_err());
-        assert!(u64::from_sql(&Type::UBIGINT, &[0; 4]).is_err());
+        assert!(u32::from_sql(&Type::UINT, &[0]).is_err());
+        // 4 bytes → u64 widening should succeed (UINT → UBIGINT)
+        assert!(u64::from_sql(&Type::UBIGINT, &[0; 4]).is_ok());
+        assert!(u64::from_sql(&Type::UBIGINT, &[0]).is_err());
         assert!(f32::from_sql(&Type::FLOAT, &[0, 0]).is_err());
         assert!(f64::from_sql(&Type::DOUBLE, &[0; 4]).is_err());
     }
