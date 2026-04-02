@@ -40,6 +40,17 @@ impl CubridOid {
         }
     }
 
+    /// Encode this OID into 8 bytes (big-endian) for wire transmission.
+    ///
+    /// Layout: `page_id` (4 bytes) + `slot_id` (2 bytes) + `vol_id` (2 bytes).
+    pub fn to_bytes(&self) -> [u8; 8] {
+        let mut buf = [0u8; 8];
+        buf[0..4].copy_from_slice(&self.page_id.to_be_bytes());
+        buf[4..6].copy_from_slice(&self.slot_id.to_be_bytes());
+        buf[6..8].copy_from_slice(&self.vol_id.to_be_bytes());
+        buf
+    }
+
     /// Returns `true` if this OID is the zero (null) OID.
     pub fn is_null(&self) -> bool {
         self.page_id == 0 && self.slot_id == 0 && self.vol_id == 0

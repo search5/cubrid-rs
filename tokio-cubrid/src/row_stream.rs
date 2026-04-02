@@ -194,6 +194,18 @@ impl RowStream {
     }
 }
 
+impl Drop for RowStream {
+    fn drop(&mut self) {
+        // CCI behavior: only send CURSOR_CLOSE for holdable cursors.
+        // Non-holdable cursors are freed automatically when the statement
+        // handle is closed (CLOSE_REQ_HANDLE) or the transaction ends.
+        if !self.done && self.statement.is_holdable() {
+            self.client
+                .cursor_close_fire_and_forget(self.statement.query_handle());
+        }
+    }
+}
+
 impl std::fmt::Debug for RowStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RowStream")

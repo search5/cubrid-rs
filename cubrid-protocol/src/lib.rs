@@ -34,7 +34,7 @@ pub mod types;
 // Re-exports for convenience
 pub use cas_info::CasInfo;
 pub use error::Error;
-pub use types::{CubridDataType, FunctionCode, StatementType};
+pub use types::{CubridDataType, DbParameter, FunctionCode, StatementType, XaOp, Xid};
 
 // ---------------------------------------------------------------------------
 // Protocol version constants

@@ -41,10 +41,13 @@ impl LobType {
     }
 
     /// Create a `LobType` from a CUBRID type code.
+    ///
+    /// Accepts both the standard codes (23/24) and the internal encoding
+    /// with a +10 offset (33/34) that the server may return in LOB handles.
     pub fn from_type_code(code: i32) -> Result<Self, Box<dyn Error + Sync + Send>> {
         match code {
-            23 => Ok(LobType::Blob),
-            24 => Ok(LobType::Clob),
+            23 | 33 => Ok(LobType::Blob),
+            24 | 34 => Ok(LobType::Clob),
             other => Err(format!("invalid LOB type code: {}", other).into()),
         }
     }
@@ -86,6 +89,50 @@ impl CubridLobHandle {
             size,
             locator,
         }
+    }
+
+    /// Decode a LOB handle from wire-format bytes.
+    ///
+    /// Wire layout: `db_type(4) + size(8) + locator_size(4) + locator(N)`.
+    pub fn from_wire(raw: &[u8]) -> Result<Self, Box<dyn Error + Sync + Send>> {
+        if raw.len() < 16 {
+            return Err(format!(
+                "LOB handle too short: {} bytes (need at least 16)",
+                raw.len()
+            )
+            .into());
+        }
+        let type_code = int_from_sql(&raw[..4])?;
+        let lob_type = LobType::from_type_code(type_code)?;
+        let size = bigint_from_sql(&raw[4..12])?;
+        let locator_size = int_from_sql(&raw[12..16])? as usize;
+        if raw.len() < 16 + locator_size {
+            return Err(format!(
+                "LOB handle truncated: expected {} locator bytes, got {}",
+                locator_size,
+                raw.len().saturating_sub(16)
+            )
+            .into());
+        }
+        let locator = string_from_sql(&raw[16..16 + locator_size])?;
+        Ok(CubridLobHandle {
+            lob_type,
+            size,
+            locator: locator.to_owned(),
+        })
+    }
+
+    /// Encode this LOB handle into wire-format bytes.
+    ///
+    /// Wire layout: `db_type(4) + size(8) + locator_size(4) + locator(N+1)`.
+    pub fn to_wire(&self) -> Vec<u8> {
+        let mut buf = BytesMut::new();
+        int_to_sql(self.lob_type.type_code(), &mut buf);
+        bigint_to_sql(self.size, &mut buf);
+        let locator_len = (self.locator.len() + 1) as i32;
+        int_to_sql(locator_len, &mut buf);
+        string_to_sql(&self.locator, &mut buf);
+        buf.to_vec()
     }
 }
 

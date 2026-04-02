@@ -27,8 +27,11 @@ pub use tls::{MakeTlsConnect, MaybeTlsStream, NoTls, SslMode, TlsConnect};
 pub use transaction::Transaction;
 pub use version::{CubridDialect, CubridVersion};
 
-// Re-export SchemaType for use with Client::schema_info
-pub use cubrid_protocol::types::SchemaType;
+// Re-export protocol types for use with Client methods.
+pub use cubrid_protocol::types::{DbParameter, SchemaType, XaOp, Xid};
+
+// Re-export LOB type for use with Client::lob_new.
+pub use cubrid_types::LobType;
 
 // Re-export commonly used CUBRID-specific types from cubrid-types so that
 // users can access them without adding cubrid-types to their Cargo.toml.

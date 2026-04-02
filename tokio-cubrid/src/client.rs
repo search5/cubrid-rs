@@ -12,20 +12,21 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
 
 use cubrid_protocol::authentication::BrokerInfo;
 use cubrid_protocol::cas_info::CasInfo;
 use cubrid_protocol::message::backend::{
-    DbVersionResponse, ExecuteResponse, FetchResult, PrepareResponse, ResponseFrame,
-    SchemaInfoResponse,
+    DbParameterResponse, DbVersionResponse, ExecuteResponse, FetchResult,
+    GeneratedKeysResponse, LastInsertIdResponse, LobNewResponse, LobReadResponse,
+    OidGetResponse, PrepareResponse, ResponseFrame, SchemaInfoResponse, XaRecoverResponse,
 };
 use cubrid_protocol::message::frontend;
-use cubrid_protocol::types::{SchemaType, TransactionOp};
+use cubrid_protocol::types::{DbParameter, SchemaType, TransactionOp, XaOp, Xid};
 use cubrid_protocol::CubridDataType;
-use cubrid_types::ToSql;
+use cubrid_types::{CubridLobHandle, CubridOid, LobType, ToSql};
 
 use crate::config::Config;
 use crate::connection::Request;
@@ -42,12 +43,9 @@ use crate::version::{CubridDialect, CubridVersion};
 
 /// Internal shared state of the client.
 ///
-/// This is wrapped in an `Arc` so that cloned `Client` instances and the
-/// `Connection` background task can share the same communication channel
-/// and session state.
-/// Internal shared state of the client.
-///
-/// Exposed as public for testing; not part of the stable API.
+/// Wrapped in `Arc` so that cloned `Client` instances and the `Connection`
+/// background task share the same channel and session state.
+/// Exposed for testing; not part of the stable API.
 #[doc(hidden)]
 pub struct InnerClient {
     /// Channel sender for dispatching requests to the background connection.
@@ -128,10 +126,7 @@ pub struct Client {
 impl Client {
     /// Create a new Client from shared inner state and version information.
     ///
-    /// Retained for testing; production code uses [`new_with_config`].
-    /// Create a new Client from shared inner state and version information.
-    ///
-    /// Exposed as public for testing; not part of the stable API.
+    /// Exposed for testing; not part of the stable API.
     #[doc(hidden)]
     #[allow(dead_code)]
     pub fn new(
@@ -205,18 +200,14 @@ impl Client {
     }
 
     /// Returns the broker information from the initial handshake.
-    ///
-    /// Useful for debugging and monitoring: exposes the DBMS type, protocol
-    /// version, statement pooling capability, and other broker metadata.
-    pub fn broker_info(&self) -> &BrokerInfo {
+    #[allow(dead_code)]
+    pub(crate) fn broker_info(&self) -> &BrokerInfo {
         &self.inner.broker_info
     }
 
     /// Returns the session ID assigned by the server.
-    ///
-    /// The session ID is a 20-byte opaque token used by the CUBRID server
-    /// to maintain session state. Exposed for debugging and monitoring.
-    pub fn session_id(&self) -> &[u8; 20] {
+    #[allow(dead_code)]
+    pub(crate) fn session_id(&self) -> &[u8; 20] {
         &self.inner.session_id
     }
 
@@ -248,9 +239,6 @@ impl Client {
     /// still be processed by the server, but the response is discarded.
     /// Avoid cancelling in-flight requests (e.g., via `tokio::select!`);
     /// instead, let them complete and discard the result.
-    /// Sends a pre-serialized request to the background connection.
-    ///
-    /// Exposed as public for testing; not part of the stable API.
     #[doc(hidden)]
     pub async fn send_request(&self, data: BytesMut) -> Result<ResponseFrame, Error> {
         let (tx, rx) = oneshot::channel();
@@ -344,6 +332,229 @@ impl Client {
             log::warn!("Failed to close statement handle: {}", e);
         }
         Ok(result)
+    }
+
+    /// Execute a non-SELECT SQL statement using PREPARE_AND_EXECUTE (FC 41)
+    /// in a single network round-trip.
+    ///
+    /// More efficient than [`execute_sql`](Client::execute_sql) for one-shot
+    /// DML statements (INSERT, UPDATE, DELETE) with literal values that
+    /// don't need bind parameters or re-execution.
+    ///
+    /// For statements with bind parameters, use [`execute_sql`](Client::execute_sql).
+    /// For SELECT queries, use [`prepare_and_query_sql`](Client::prepare_and_query_sql).
+    pub async fn prepare_and_execute_sql(&self, sql: &str) -> Result<u64, Error> {
+        let msg = frontend::prepare_and_execute(
+            &self.cas_info(),
+            sql,
+            0x00,
+            self.inner.auto_commit.load(Ordering::Relaxed),
+            0x00,
+            false, // is_select: false for DML
+            self.query_timeout_ms,
+            &[],
+        );
+        let frame = self.send_request(msg).await?;
+        if frame.is_error() {
+            return Err(Error::Protocol(frame.parse_error()));
+        }
+        // FC 41 response: response_code = query handle (NOT affected rows).
+        // Body = prepare_body(18 bytes for DML) + execute_body.
+        //
+        // Prepare body: cache_lifetime(4) + stmt_type(1) + bind_count(4)
+        //   + updatable(1) + col_count(4) + trailing(4) = 18 bytes
+        // Execute body: cache_reusable(1) + result_count(4)
+        //   + [stmt_type(1) + affected(4) + oid(8) + cache_sec(4) + cache_usec(4)] * N
+        let payload = &frame.payload;
+        let exec_offset = 18;
+        if payload.len() > exec_offset + 1 + 4 + 1 + 4 {
+            let result_count = i32::from_be_bytes([
+                payload[exec_offset + 1],
+                payload[exec_offset + 2],
+                payload[exec_offset + 3],
+                payload[exec_offset + 4],
+            ]);
+            if result_count > 0 {
+                let affected = i32::from_be_bytes([
+                    payload[exec_offset + 6],
+                    payload[exec_offset + 7],
+                    payload[exec_offset + 8],
+                    payload[exec_offset + 9],
+                ]);
+                return Ok(affected.max(0) as u64);
+            }
+        }
+        Ok(frame.response_code.max(0) as u64)
+    }
+
+    /// Execute a SELECT query using PREPARE_AND_EXECUTE (FC 41) in a single
+    /// network round-trip and return all result rows.
+    ///
+    /// More efficient than [`query_sql`](Client::query_sql) for one-shot
+    /// SELECT queries with literal values that don't need bind parameters
+    /// or re-execution.
+    ///
+    /// For queries with bind parameters, use [`query_sql`](Client::query_sql).
+    pub async fn prepare_and_query_sql(&self, sql: &str) -> Result<Vec<Row>, Error> {
+        let msg = frontend::prepare_and_execute(
+            &self.cas_info(),
+            sql,
+            0x00,
+            self.inner.auto_commit.load(Ordering::Relaxed),
+            0x00,
+            true, // is_select: true for SELECT
+            self.query_timeout_ms,
+            &[],
+        );
+        let frame = self.send_request(msg).await?;
+        if frame.is_error() {
+            return Err(Error::Protocol(frame.parse_error()));
+        }
+
+        let query_handle = frame.response_code;
+        let mut cursor = &frame.payload[..];
+
+        // --- Phase 1: Parse prepare body ---
+        // cache_lifetime(4) + stmt_type(1) + bind_count(4) + updatable(1) + col_count(4)
+        if cursor.remaining() < 14 {
+            return Err(Error::Protocol(cubrid_protocol::Error::InvalidMessage(
+                "FC 41 prepare body too short".to_string(),
+            )));
+        }
+        let _cache_lifetime = cursor.get_i32();
+        let stmt_type_byte = cursor.get_u8();
+        let statement_type = cubrid_protocol::StatementType::try_from(stmt_type_byte)
+            .map_err(|e| Error::Protocol(e))?;
+        let _bind_count = cursor.get_i32();
+        let _updatable = cursor.get_u8();
+        let col_count = cursor.get_i32();
+
+        // Column metadata (only present for SELECT, col_count > 0)
+        let columns_meta = if col_count > 0 {
+            cubrid_protocol::message::backend::parse_column_metadata(
+                &mut cursor,
+                col_count,
+                self.inner.protocol_version,
+            )?
+        } else {
+            vec![]
+        };
+
+        let columns: Vec<Column> = columns_meta.iter().map(Column::from_metadata).collect();
+        let column_types: Vec<CubridDataType> =
+            columns.iter().map(|c| c.type_.data_type()).collect();
+
+        // Trailing field (4 bytes) — present in both DML and SELECT
+        if cursor.remaining() >= 4 {
+            let _trailing = cursor.get_i32();
+        }
+
+        // --- Phase 2: Parse execute body ---
+        // cache_reusable(1) + result_count(4) + result_info[] ...
+        if cursor.remaining() < 5 {
+            return Ok(vec![]);
+        }
+        let _cache_reusable = cursor.get_u8();
+        let result_count = cursor.get_i32();
+
+        let mut total_tuples = 0i32;
+        for i in 0..result_count {
+            if cursor.remaining() < 21 {
+                break;
+            }
+            let _ri_stmt_type = cursor.get_u8();
+            let affected = cursor.get_i32();
+            if i == 0 {
+                total_tuples = affected;
+            }
+            cursor.advance(8); // OID
+            let _cache_sec = cursor.get_i32();
+            let _cache_usec = cursor.get_i32();
+        }
+
+        // include_column_info (PROTOCOL_V2+)
+        if self.inner.protocol_version > 1 && cursor.remaining() >= 1 {
+            let include_col_info = cursor.get_u8();
+            if include_col_info == 1 && cursor.remaining() >= 9 {
+                let _rcl = cursor.get_i32();
+                let _st = cursor.get_u8();
+                let _nm = cursor.get_i32();
+                if cursor.remaining() >= 1 {
+                    let _uf = cursor.get_u8();
+                }
+                if cursor.remaining() >= 4 {
+                    let exec_col_count = cursor.get_i32();
+                    if exec_col_count > 0 {
+                        let _ = cubrid_protocol::message::backend::parse_column_metadata(
+                            &mut cursor,
+                            exec_col_count,
+                            self.inner.protocol_version,
+                        );
+                    }
+                }
+            }
+        }
+
+        // shard_id (PROTOCOL_V5+)
+        if self.inner.protocol_version > 4 && cursor.remaining() >= 4 {
+            let _shard_id = cursor.get_i32();
+        }
+
+        // --- Phase 3: Parse inline fetch data ---
+        let columns_arc = Arc::new(columns);
+        let mut rows = Vec::new();
+
+        if statement_type.has_result_set() && cursor.remaining() >= 8 {
+            let _fetch_code = cursor.get_i32();
+            let tuple_count = cursor.get_i32();
+            if tuple_count > 0 && !column_types.is_empty() {
+                let tuples = cubrid_protocol::message::backend::parse_tuples(
+                    &mut cursor,
+                    tuple_count,
+                    column_types.len(),
+                    &column_types,
+                )?;
+                rows.extend(convert_tuples(&columns_arc, &tuples));
+            }
+        }
+
+        // --- Phase 4: Fetch remaining rows if needed ---
+        let mut fetched = rows.len() as i32;
+        while fetched < total_tuples {
+            let start = fetched + 1;
+            let fetch_msg = frontend::fetch(
+                &self.cas_info(),
+                query_handle,
+                start,
+                100,
+            );
+            let fetch_frame = self.send_request(fetch_msg).await?;
+            if fetch_frame.is_error() {
+                let err = fetch_frame.parse_error();
+                if let cubrid_protocol::Error::Cas { code, .. } = &err {
+                    if *code == -1012 {
+                        break; // CAS_ER_NO_MORE_DATA
+                    }
+                }
+                return Err(err.into());
+            }
+            let fetch_result = FetchResult::parse(&fetch_frame, &column_types)?;
+            if fetch_result.tuple_count <= 0 {
+                break;
+            }
+            rows.extend(convert_tuples(&columns_arc, &fetch_result.tuples));
+            fetched = fetched.saturating_add(fetch_result.tuple_count.max(0));
+        }
+
+        // Close the statement handle
+        let close_msg = frontend::close_req_handle(
+            &self.cas_info(),
+            query_handle,
+            self.inner.auto_commit.load(Ordering::Relaxed),
+        );
+        let _ = self.send_request(close_msg).await;
+
+        Ok(rows)
     }
 
     /// Query with a prepared statement and return all result rows.
@@ -570,6 +781,309 @@ impl Client {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // Database parameter API
+    // -----------------------------------------------------------------------
+
+    /// Retrieve the value of a database session parameter.
+    ///
+    /// # Parameters
+    ///
+    /// - `param`: The parameter to query (e.g., `DbParameter::IsolationLevel`).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example(client: &tokio_cubrid::Client) -> Result<(), tokio_cubrid::Error> {
+    /// use tokio_cubrid::DbParameter;
+    /// let isolation = client.get_db_parameter(DbParameter::IsolationLevel).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_db_parameter(&self, param: DbParameter) -> Result<i32, Error> {
+        let msg = frontend::get_db_parameter(&self.cas_info(), i32::from(param));
+        let frame = self.send_request(msg).await?;
+        let resp = DbParameterResponse::parse(&frame)?;
+        Ok(resp.value)
+    }
+
+    /// Set a database session parameter value.
+    ///
+    /// # Parameters
+    ///
+    /// - `param`: The parameter to set (must not be `AutoCommit`).
+    /// - `value`: The new value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `param` is `DbParameter::AutoCommit`. CCI manages
+    /// autocommit client-side; use [`set_autocommit`](Client::set_autocommit)
+    /// instead.
+    pub async fn set_db_parameter(&self, param: DbParameter, value: i32) -> Result<(), Error> {
+        if param == DbParameter::AutoCommit {
+            return Err(Error::Protocol(cubrid_protocol::Error::InvalidMessage(
+                "use set_autocommit() instead of set_db_parameter(AutoCommit)".to_string(),
+            )));
+        }
+        let msg = frontend::set_db_parameter(&self.cas_info(), i32::from(param), value);
+        let frame = self.send_request(msg).await?;
+        cubrid_protocol::message::backend::parse_simple_response(&frame)?;
+        Ok(())
+    }
+
+    /// Retrieve the number of rows affected by the last executed statement.
+    pub async fn get_row_count(&self) -> Result<i64, Error> {
+        let msg = frontend::get_row_count(&self.cas_info());
+        let frame = self.send_request(msg).await?;
+        if frame.is_error() {
+            return Err(Error::Protocol(frame.parse_error()));
+        }
+        Ok(frame.response_code as i64)
+    }
+
+    /// Retrieve the last auto-generated insert ID.
+    ///
+    /// Returns the ID as a string since CUBRID AUTO_INCREMENT values
+    /// can be NUMERIC types that exceed i64 range.
+    pub async fn get_last_insert_id(&self) -> Result<String, Error> {
+        let msg = frontend::get_last_insert_id(&self.cas_info());
+        let frame = self.send_request(msg).await?;
+        let resp = LastInsertIdResponse::parse(&frame)?;
+        Ok(resp.value)
+    }
+
+    /// Close a server-side cursor without closing the statement handle.
+    ///
+    /// Releases the result set on the CAS process while keeping the
+    /// prepared statement available for re-execution. This is primarily
+    /// needed for **holdable cursors** (`PrepareFlag::HOLDABLE`) whose
+    /// result sets survive transaction commits. For non-holdable cursors,
+    /// the result set is freed automatically by `CLOSE_REQ_HANDLE`
+    /// (statement drop) or transaction end.
+    ///
+    /// Corresponds to CCI's `cci_close_query_result`.
+    pub async fn cursor_close(&self, query_handle: i32) -> Result<(), Error> {
+        let msg = frontend::cursor_close(&self.cas_info(), query_handle);
+        let frame = self.send_request(msg).await?;
+        cubrid_protocol::message::backend::parse_simple_response(&frame)?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // LOB API
+    // -----------------------------------------------------------------------
+
+    /// Create a new empty LOB on the server.
+    ///
+    /// Returns a [`CubridLobHandle`] that can be used with
+    /// [`lob_read`](Client::lob_read) and [`lob_write`](Client::lob_write).
+    pub async fn lob_new(&self, lob_type: LobType) -> Result<CubridLobHandle, Error> {
+        let type_code = match lob_type {
+            LobType::Blob => 23u8,
+            LobType::Clob => 24u8,
+        };
+        let msg = frontend::lob_new(&self.cas_info(), type_code);
+        let frame = self.send_request(msg).await?;
+        let resp = LobNewResponse::parse(&frame)?;
+        CubridLobHandle::from_wire(&resp.handle_bytes).map_err(Error::Conversion)
+    }
+
+    /// Write data to a LOB at the specified byte offset.
+    ///
+    /// Returns the number of bytes written. For large data, call this
+    /// method in a loop with successive offsets (maximum ~1 MB per call).
+    pub async fn lob_write(
+        &self,
+        lob_handle: &CubridLobHandle,
+        offset: i64,
+        data: &[u8],
+    ) -> Result<i32, Error> {
+        let handle_bytes = lob_handle.to_wire();
+        let msg = frontend::lob_write(&self.cas_info(), &handle_bytes, offset, data);
+        let frame = self.send_request(msg).await?;
+        if frame.is_error() {
+            return Err(Error::Protocol(frame.parse_error()));
+        }
+        Ok(frame.response_code)
+    }
+
+    /// Read data from a LOB at the specified byte offset.
+    ///
+    /// Returns the raw LOB data bytes. For large LOBs, call this method
+    /// in a loop with successive offsets (maximum ~1 MB per call).
+    pub async fn lob_read(
+        &self,
+        lob_handle: &CubridLobHandle,
+        offset: i64,
+        length: i32,
+    ) -> Result<Vec<u8>, Error> {
+        let handle_bytes = lob_handle.to_wire();
+        let msg = frontend::lob_read(&self.cas_info(), &handle_bytes, offset, length);
+        let frame = self.send_request(msg).await?;
+        let resp = LobReadResponse::parse(&frame)?;
+        Ok(resp.data)
+    }
+
+    // -----------------------------------------------------------------------
+    // OID API
+    // -----------------------------------------------------------------------
+
+    /// Retrieve attribute values for an object identified by OID.
+    ///
+    /// Returns a single-row result set containing the attribute values.
+    /// Pass an empty `attrs` slice to retrieve all attributes.
+    pub async fn oid_get(
+        &self,
+        oid: &CubridOid,
+        attrs: &[&str],
+    ) -> Result<Vec<Row>, Error> {
+        let oid_bytes = oid.to_bytes();
+        let msg = frontend::oid_get(&self.cas_info(), &oid_bytes, attrs);
+        let frame = self.send_request(msg).await?;
+        let resp = OidGetResponse::parse(&frame, self.inner.protocol_version)
+            .map_err(Error::Protocol)?;
+        let columns: Vec<Column> = resp.columns.iter().map(Column::from_metadata).collect();
+        let columns_arc = Arc::new(columns);
+        Ok(convert_tuples(&columns_arc, &resp.values))
+    }
+
+    /// Update attribute values on an object identified by OID.
+    ///
+    /// The attribute names and values must be in the same order. Each
+    /// value is serialized using the same type inference as
+    /// [`execute`](Client::execute).
+    pub async fn oid_put(
+        &self,
+        oid: &CubridOid,
+        attrs: &[&str],
+        values: &[&(dyn ToSql + Sync)],
+    ) -> Result<(), Error> {
+        let oid_bytes = oid.to_bytes();
+        let value_bytes = serialize_params(values, &[])?;
+        let msg = frontend::oid_put(&self.cas_info(), &oid_bytes, attrs, &value_bytes);
+        let frame = self.send_request(msg).await?;
+        cubrid_protocol::message::backend::parse_simple_response(&frame)?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Advanced result set API
+    // -----------------------------------------------------------------------
+
+    /// Advance to the next result set in a multi-result query.
+    ///
+    /// Returns the number of affected rows in the next result, or
+    /// a negative value if there are no more result sets.
+    pub async fn next_result(&self, query_handle: i32) -> Result<i32, Error> {
+        let msg = frontend::next_result(&self.cas_info(), query_handle);
+        let frame = self.send_request(msg).await?;
+        if frame.is_error() {
+            return Err(Error::Protocol(frame.parse_error()));
+        }
+        Ok(frame.response_code)
+    }
+
+    /// Update a row at the given cursor position.
+    ///
+    /// Requires that the statement was prepared with
+    /// `PrepareFlag::UPDATABLE`. Each value is serialized using the same
+    /// type inference as [`execute`](Client::execute).
+    pub async fn cursor_update(
+        &self,
+        query_handle: i32,
+        cursor_pos: i32,
+        values: &[&(dyn ToSql + Sync)],
+    ) -> Result<(), Error> {
+        let value_bytes = serialize_params(values, &[])?;
+        let msg = frontend::cursor_update(&self.cas_info(), query_handle, cursor_pos, &value_bytes);
+        let frame = self.send_request(msg).await?;
+        cubrid_protocol::message::backend::parse_simple_response(&frame)?;
+        Ok(())
+    }
+
+    /// Retrieve auto-generated keys from the last INSERT statement.
+    ///
+    /// The statement must have been executed with
+    /// `ExecuteFlag::RETURN_GENERATED_KEYS`.
+    pub async fn get_generated_keys(&self, query_handle: i32) -> Result<Vec<i64>, Error> {
+        let msg = frontend::get_generated_keys(&self.cas_info(), query_handle);
+        let frame = self.send_request(msg).await?;
+        let resp = GeneratedKeysResponse::parse(&frame)?;
+        Ok(resp.keys)
+    }
+
+    // -----------------------------------------------------------------------
+    // XA distributed transaction API
+    // -----------------------------------------------------------------------
+
+    /// Prepare an XA transaction for commit (first phase of 2PC).
+    pub async fn xa_prepare(&self, xid: &Xid) -> Result<(), Error> {
+        let msg = frontend::xa_prepare(&self.cas_info(), xid);
+        let frame = self.send_request(msg).await?;
+        cubrid_protocol::message::backend::parse_simple_response(&frame)?;
+        Ok(())
+    }
+
+    /// Retrieve the list of in-doubt (prepared) XA transactions.
+    pub async fn xa_recover(&self) -> Result<Vec<Xid>, Error> {
+        let msg = frontend::xa_recover(&self.cas_info());
+        let frame = self.send_request(msg).await?;
+        let resp = XaRecoverResponse::parse(&frame)?;
+        Ok(resp.xids)
+    }
+
+    /// Commit or rollback a prepared XA transaction (second phase of 2PC).
+    pub async fn xa_end_tran(&self, xid: &Xid, op: XaOp) -> Result<(), Error> {
+        let msg = frontend::xa_end_tran(&self.cas_info(), xid, op);
+        let frame = self.send_request(msg).await?;
+        cubrid_protocol::message::backend::parse_simple_response(&frame)?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Schema inheritance queries (SQL-based)
+    // -----------------------------------------------------------------------
+
+    /// List the direct parent (super) classes of a table.
+    ///
+    /// CUBRID supports class inheritance via `CREATE TABLE child UNDER parent`.
+    /// This queries the `db_direct_super_class` system catalog table.
+    pub async fn list_super_classes(&self, table_name: &str) -> Result<Vec<String>, Error> {
+        let rows = self
+            .query_sql(
+                "SELECT super_class_name FROM db_direct_super_class WHERE class_name = ? ORDER BY super_class_name",
+                &[&table_name],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let s: String = r.get(0);
+                s.trim().to_string()
+            })
+            .collect())
+    }
+
+    /// List the direct child (sub) classes of a table.
+    ///
+    /// CUBRID supports class inheritance via `CREATE TABLE child UNDER parent`.
+    /// This queries the `db_direct_super_class` system catalog table.
+    pub async fn list_sub_classes(&self, table_name: &str) -> Result<Vec<String>, Error> {
+        let rows = self
+            .query_sql(
+                "SELECT class_name FROM db_direct_super_class WHERE super_class_name = ? ORDER BY class_name",
+                &[&table_name],
+            )
+            .await?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let s: String = r.get(0);
+                s.trim().to_string()
+            })
+            .collect())
+    }
+
     /// Retrieve the database server version string.
     ///
     /// This sends a GET_DB_VERSION request to the server and returns
@@ -716,11 +1230,7 @@ impl Client {
     /// Fire-and-forget rollback for use in Drop contexts.
     ///
     /// Sends the rollback message through the channel without waiting for
-    /// a response. If the channel is closed (e.g., the connection was
-    /// dropped), the failure is logged at debug level but otherwise ignored.
-    /// Fire-and-forget rollback for use in Drop contexts.
-    ///
-    /// Exposed as public for testing; not part of the stable API.
+    /// a response. If the channel is closed, the failure is silently ignored.
     #[doc(hidden)]
     pub fn rollback_fire_and_forget(&self) {
         let msg = frontend::end_tran(&self.cas_info(), TransactionOp::Rollback);
@@ -731,7 +1241,19 @@ impl Client {
         }
     }
 
-    /// Fire-and-forget rollback to a named savepoint (for Drop contexts).
+    /// Fire-and-forget cursor close for holdable cursors (for Drop contexts).
+    ///
+    /// Sends `CURSOR_CLOSE` without waiting for a response. Used by
+    /// `RowStream::Drop` to release holdable cursor resources.
+    pub(crate) fn cursor_close_fire_and_forget(&self, query_handle: i32) {
+        let msg = frontend::cursor_close(&self.cas_info(), query_handle);
+        let (tx, _rx) = oneshot::channel();
+        let request = Request { data: msg, sender: tx };
+        if self.inner.sender.send(request).is_err() {
+            log::debug!("cursor_close fire-and-forget: channel closed");
+        }
+    }
+
     /// Fire-and-forget rollback to a named savepoint (for Drop contexts).
     ///
     /// Exposed as public for testing; not part of the stable API.

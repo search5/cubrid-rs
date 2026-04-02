@@ -24,7 +24,7 @@ use bytes::{BufMut, BytesMut};
 use byteorder::{BigEndian, ByteOrder};
 
 use crate::cas_info::CasInfo;
-use crate::types::{FunctionCode, SchemaType, TransactionOp};
+use crate::types::{FunctionCode, SchemaType, TransactionOp, XaOp, Xid};
 use crate::{
     write_cubrid_string, write_param_byte, write_param_int, write_param_int64, write_param_null,
     NET_SIZE_CAS_INFO, NET_SIZE_INT,
@@ -365,12 +365,17 @@ pub fn prepare_and_execute(
     params: &[u8],
 ) -> BytesMut {
     build_message(cas_info, FunctionCode::PrepareAndExecute, |buf| {
-        // Prepare phase arguments
+        // argv[0]: prepare_argc_count — number of prepare-phase arguments.
+        // CAS server reads this first to know where prepare args end and
+        // execute args begin (see cas_function.c fn_prepare_and_execute).
+        write_param_int(3, buf); // 3 args: sql + prepare_flag + auto_commit
+
+        // Prepare phase arguments (argv[1..3])
         write_cubrid_string(sql, buf);
         write_param_byte(prepare_flag, buf);
         write_param_byte(auto_commit as u8, buf);
 
-        // Execute phase arguments (must match execute_with_timeout layout)
+        // Execute phase arguments (argv[4..], must match execute_with_timeout layout)
         write_param_byte(execute_flag, buf);
         write_param_int(0, buf); // max column size
         write_param_int(0, buf); // max row size
@@ -598,6 +603,94 @@ pub fn oid_put(cas_info: &CasInfo, oid: &[u8; 8], attrs: &[&str], values: &[u8])
         if !values.is_empty() {
             buf.put_slice(values);
         }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// NEXT_RESULT (FC 19)
+// ---------------------------------------------------------------------------
+
+/// Build a NEXT_RESULT request to advance to the next result set.
+///
+/// Used with multi-result queries. Returns the number of affected rows
+/// in the next result via the response code.
+pub fn next_result(cas_info: &CasInfo, query_handle: i32) -> BytesMut {
+    build_message(cas_info, FunctionCode::NextResult, |buf| {
+        write_param_int(query_handle, buf);
+    })
+}
+
+// ---------------------------------------------------------------------------
+// CURSOR_UPDATE (FC 22)
+// ---------------------------------------------------------------------------
+
+/// Build a CURSOR_UPDATE request to update a row at the given cursor position.
+///
+/// The `values` parameter contains pre-serialized bind parameter data
+/// for each column to update (type code + value per column).
+pub fn cursor_update(
+    cas_info: &CasInfo,
+    query_handle: i32,
+    cursor_pos: i32,
+    values: &[u8],
+) -> BytesMut {
+    build_message(cas_info, FunctionCode::CursorUpdate, |buf| {
+        write_param_int(query_handle, buf);
+        write_param_int(cursor_pos, buf);
+        if !values.is_empty() {
+            buf.put_slice(values);
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// GET_GENERATED_KEYS (FC 34)
+// ---------------------------------------------------------------------------
+
+/// Build a GET_GENERATED_KEYS request to retrieve auto-generated keys
+/// from the last INSERT statement.
+pub fn get_generated_keys(cas_info: &CasInfo, query_handle: i32) -> BytesMut {
+    build_message(cas_info, FunctionCode::GetGeneratedKeys, |buf| {
+        write_param_int(query_handle, buf);
+    })
+}
+
+// ---------------------------------------------------------------------------
+// XA_PREPARE (FC 28)
+// ---------------------------------------------------------------------------
+
+/// Build an XA_PREPARE request for the first phase of two-phase commit.
+pub fn xa_prepare(cas_info: &CasInfo, xid: &Xid) -> BytesMut {
+    build_message(cas_info, FunctionCode::XaPrepare, |buf| {
+        let xid_data = xid.encode();
+        buf.put_i32(xid_data.len() as i32);
+        buf.put_slice(&xid_data);
+    })
+}
+
+// ---------------------------------------------------------------------------
+// XA_RECOVER (FC 29)
+// ---------------------------------------------------------------------------
+
+/// Build an XA_RECOVER request to list in-doubt (prepared) XA transactions.
+pub fn xa_recover(cas_info: &CasInfo) -> BytesMut {
+    build_message(cas_info, FunctionCode::XaRecover, |_buf| {
+        // No additional parameters.
+    })
+}
+
+// ---------------------------------------------------------------------------
+// XA_END_TRAN (FC 30)
+// ---------------------------------------------------------------------------
+
+/// Build an XA_END_TRAN request to commit or rollback a prepared XA
+/// transaction (second phase of 2PC).
+pub fn xa_end_tran(cas_info: &CasInfo, xid: &Xid, op: XaOp) -> BytesMut {
+    build_message(cas_info, FunctionCode::XaEndTran, |buf| {
+        let xid_data = xid.encode();
+        buf.put_i32(xid_data.len() as i32);
+        buf.put_slice(&xid_data);
+        write_param_byte(op as u8, buf);
     })
 }
 
@@ -1001,8 +1094,14 @@ mod tests {
 
         verify_header(&buf, FunctionCode::PrepareAndExecute, &ci);
 
-        // SQL string should be present after header
-        let sql_len = i32::from_be_bytes([buf[9], buf[10], buf[11], buf[12]]);
+        // argv[0]: prepare_argc_count — length prefix (4) + value (3)
+        let argc_len = i32::from_be_bytes([buf[9], buf[10], buf[11], buf[12]]);
+        assert_eq!(argc_len, 4); // length prefix = 4 bytes
+        let argc_val = i32::from_be_bytes([buf[13], buf[14], buf[15], buf[16]]);
+        assert_eq!(argc_val, 3); // 3 prepare args: sql + flag + auto_commit
+
+        // argv[1]: SQL string should follow
+        let sql_len = i32::from_be_bytes([buf[17], buf[18], buf[19], buf[20]]);
         assert_eq!(sql_len, 9); // "SELECT 1" + null
     }
 
@@ -1376,6 +1475,22 @@ mod tests {
             // H7: OID operations
             (oid_get(&ci, &oid, &["a"]), FunctionCode::OidGet),
             (oid_put(&ci, &oid, &["a"], &[]), FunctionCode::OidPut),
+            // New Group B builders
+            (next_result(&ci, 1), FunctionCode::NextResult),
+            (
+                cursor_update(&ci, 1, 1, &[]),
+                FunctionCode::CursorUpdate,
+            ),
+            (get_generated_keys(&ci, 1), FunctionCode::GetGeneratedKeys),
+            (
+                xa_prepare(&ci, &Xid::new(1, b"g".to_vec(), b"b".to_vec())),
+                FunctionCode::XaPrepare,
+            ),
+            (xa_recover(&ci), FunctionCode::XaRecover),
+            (
+                xa_end_tran(&ci, &Xid::new(1, b"g".to_vec(), b"b".to_vec()), XaOp::Commit),
+                FunctionCode::XaEndTran,
+            ),
         ];
 
         for (buf, expected_func) in &messages {

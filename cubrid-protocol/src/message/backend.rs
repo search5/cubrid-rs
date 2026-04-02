@@ -20,7 +20,7 @@ use bytes::{Buf, Bytes};
 
 use crate::cas_info::CasInfo;
 use crate::error::{Error, ErrorIndicator};
-use crate::types::{CubridDataType, StatementType};
+use crate::types::{CubridDataType, StatementType, Xid};
 use crate::{NET_SIZE_CAS_INFO, NET_SIZE_INT};
 
 // ---------------------------------------------------------------------------
@@ -1087,6 +1087,213 @@ impl DbParameterResponse {
         }
         let value = cursor.get_i32();
         Ok(DbParameterResponse { value })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LastInsertIdResponse
+// ---------------------------------------------------------------------------
+
+/// Parsed response from a GET_LAST_INSERT_ID request.
+///
+/// The last auto-generated insert ID is returned as a null-terminated
+/// string in the response payload.
+#[derive(Debug, Clone)]
+pub struct LastInsertIdResponse {
+    /// The last auto-generated insert ID as a string.
+    pub value: String,
+}
+
+impl LastInsertIdResponse {
+    /// Parse a last-insert-id response from a [`ResponseFrame`].
+    pub fn parse(frame: &ResponseFrame) -> Result<Self, Error> {
+        if frame.is_error() {
+            return Err(frame.parse_error());
+        }
+        let msg_bytes: Vec<u8> = frame
+            .payload
+            .iter()
+            .take_while(|&&b| b != 0)
+            .copied()
+            .collect();
+        let value = String::from_utf8_lossy(&msg_bytes).to_string();
+        Ok(LastInsertIdResponse { value })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LobNewResponse
+// ---------------------------------------------------------------------------
+
+/// Parsed response from a LOB_NEW request.
+///
+/// Contains the raw LOB handle bytes returned by the server, which can
+/// be passed to [`lob_read`](super::frontend::lob_read) and
+/// [`lob_write`](super::frontend::lob_write).
+#[derive(Debug, Clone)]
+pub struct LobNewResponse {
+    /// The raw LOB handle bytes.
+    pub handle_bytes: Vec<u8>,
+}
+
+impl LobNewResponse {
+    /// Parse a LOB_NEW response from a [`ResponseFrame`].
+    pub fn parse(frame: &ResponseFrame) -> Result<Self, Error> {
+        if frame.is_error() {
+            return Err(frame.parse_error());
+        }
+        Ok(LobNewResponse {
+            handle_bytes: frame.payload.to_vec(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LobReadResponse
+// ---------------------------------------------------------------------------
+
+/// Parsed response from a LOB_READ request.
+#[derive(Debug, Clone)]
+pub struct LobReadResponse {
+    /// The number of bytes actually read (from `response_code`).
+    pub bytes_read: i32,
+    /// The raw LOB data.
+    pub data: Vec<u8>,
+}
+
+impl LobReadResponse {
+    /// Parse a LOB_READ response from a [`ResponseFrame`].
+    pub fn parse(frame: &ResponseFrame) -> Result<Self, Error> {
+        if frame.is_error() {
+            return Err(frame.parse_error());
+        }
+        Ok(LobReadResponse {
+            bytes_read: frame.response_code,
+            data: frame.payload.to_vec(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GeneratedKeysResponse
+// ---------------------------------------------------------------------------
+
+/// Parsed response from a GET_GENERATED_KEYS request.
+///
+/// Contains the auto-generated key values from the last INSERT statement.
+#[derive(Debug, Clone)]
+pub struct GeneratedKeysResponse {
+    /// The auto-generated key values.
+    pub keys: Vec<i64>,
+}
+
+impl GeneratedKeysResponse {
+    /// Parse a generated-keys response from a [`ResponseFrame`].
+    pub fn parse(frame: &ResponseFrame) -> Result<Self, Error> {
+        if frame.is_error() {
+            return Err(frame.parse_error());
+        }
+        let key_count = frame.response_code;
+        if key_count <= 0 {
+            return Ok(GeneratedKeysResponse { keys: vec![] });
+        }
+        let mut cursor = &frame.payload[..];
+        let mut keys = Vec::with_capacity(key_count as usize);
+        for _ in 0..key_count {
+            if cursor.remaining() < 8 {
+                break;
+            }
+            keys.push(cursor.get_i64());
+        }
+        Ok(GeneratedKeysResponse { keys })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// XaRecoverResponse
+// ---------------------------------------------------------------------------
+
+/// Parsed response from an XA_RECOVER request.
+///
+/// Contains the list of in-doubt (prepared but not committed/rolled back)
+/// XA transaction identifiers.
+#[derive(Debug, Clone)]
+pub struct XaRecoverResponse {
+    /// The in-doubt XA transaction identifiers.
+    pub xids: Vec<Xid>,
+}
+
+impl XaRecoverResponse {
+    /// Parse an XA_RECOVER response from a [`ResponseFrame`].
+    pub fn parse(frame: &ResponseFrame) -> Result<Self, Error> {
+        if frame.is_error() {
+            return Err(frame.parse_error());
+        }
+        let count = frame.response_code;
+        if count <= 0 {
+            return Ok(XaRecoverResponse { xids: vec![] });
+        }
+        let mut cursor = &frame.payload[..];
+        let mut xids = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            if cursor.remaining() < 4 {
+                break;
+            }
+            let xid_len = cursor.get_i32() as usize;
+            if cursor.remaining() < xid_len {
+                break;
+            }
+            let xid = Xid::decode(&cursor[..xid_len])?;
+            cursor.advance(xid_len);
+            xids.push(xid);
+        }
+        Ok(XaRecoverResponse { xids })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OidGetResponse
+// ---------------------------------------------------------------------------
+
+/// Parsed response from an OID_GET request.
+///
+/// Returns the attribute values of an object identified by OID.
+/// The response contains column metadata and a single result row,
+/// similar to a one-row SELECT result.
+#[derive(Debug, Clone)]
+pub struct OidGetResponse {
+    /// Number of columns (from `response_code`).
+    pub column_count: i32,
+    /// Column metadata for each attribute.
+    pub columns: Vec<ColumnMetadata>,
+    /// The single result row (one tuple with values per column).
+    pub values: Vec<Tuple>,
+}
+
+impl OidGetResponse {
+    /// Parse an OID_GET response from a [`ResponseFrame`].
+    pub fn parse(frame: &ResponseFrame, protocol_version: u8) -> Result<Self, Error> {
+        if frame.is_error() {
+            return Err(frame.parse_error());
+        }
+        let col_count = frame.response_code;
+        if col_count <= 0 {
+            return Ok(OidGetResponse {
+                column_count: 0,
+                columns: vec![],
+                values: vec![],
+            });
+        }
+        let mut cursor = &frame.payload[..];
+        let columns = parse_column_metadata(&mut cursor, col_count, protocol_version)?;
+        let column_types: Vec<CubridDataType> =
+            columns.iter().map(|c| c.column_type).collect();
+        let tuples = parse_tuples(&mut cursor, 1, columns.len(), &column_types)?;
+        Ok(OidGetResponse {
+            column_count: col_count,
+            columns,
+            values: tuples,
+        })
     }
 }
 

@@ -71,6 +71,9 @@ struct StatementInner {
     bind_count: i32,
     /// Column metadata for the result set.
     columns: Vec<Column>,
+    /// Whether this statement was prepared with `PrepareFlag::HOLDABLE`,
+    /// meaning its result set cursor survives transaction commits.
+    holdable: bool,
     /// Weak reference to the client's shared state for sending
     /// CLOSE_REQ_HANDLE on drop. Uses Weak to avoid preventing
     /// client cleanup (no circular reference).
@@ -136,6 +139,33 @@ impl Statement {
                 statement_type,
                 bind_count,
                 columns,
+                holdable: false,
+                client,
+                closed: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    /// Create a new holdable Statement.
+    ///
+    /// Holdable statements keep their result set cursor open across
+    /// transaction commits. When the cursor is no longer needed,
+    /// `CURSOR_CLOSE` must be sent to release server-side resources.
+    #[allow(dead_code)]
+    pub(crate) fn new_holdable(
+        query_handle: i32,
+        statement_type: StatementType,
+        bind_count: i32,
+        columns: Vec<Column>,
+        client: Option<Weak<InnerClient>>,
+    ) -> Self {
+        Statement {
+            inner: Arc::new(StatementInner {
+                query_handle,
+                statement_type,
+                bind_count,
+                columns,
+                holdable: true,
                 client,
                 closed: AtomicBool::new(false),
             }),
@@ -160,6 +190,14 @@ impl Statement {
     /// Returns column metadata for the result set.
     pub fn columns(&self) -> &[Column] {
         &self.inner.columns
+    }
+
+    /// Returns `true` if this statement was prepared as holdable.
+    ///
+    /// Holdable cursors survive transaction commits and require explicit
+    /// `CURSOR_CLOSE` to release server resources.
+    pub fn is_holdable(&self) -> bool {
+        self.inner.holdable
     }
 
     /// Returns `true` if this statement type produces a row-based result set.

@@ -964,6 +964,125 @@ impl From<DbmsType> for u8 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// XaOp
+// ---------------------------------------------------------------------------
+
+/// XA end transaction operations for the XA_END_TRAN function code.
+///
+/// Used to commit or rollback a prepared XA distributed transaction
+/// during the second phase of two-phase commit (2PC).
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum XaOp {
+    /// Commit a prepared XA transaction.
+    Commit = 1,
+    /// Rollback a prepared XA transaction.
+    Rollback = 2,
+}
+
+impl TryFrom<u8> for XaOp {
+    type Error = Error;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(XaOp::Commit),
+            2 => Ok(XaOp::Rollback),
+            _ => Err(Error::InvalidMessage(format!(
+                "unknown XA op: {}",
+                value
+            ))),
+        }
+    }
+}
+
+impl From<XaOp> for u8 {
+    fn from(op: XaOp) -> u8 {
+        op as u8
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Xid (XA Transaction Identifier)
+// ---------------------------------------------------------------------------
+
+/// An XA transaction identifier following the X/Open XA specification.
+///
+/// Used with [`xa_prepare`](crate::message::frontend::xa_prepare),
+/// [`xa_recover`](crate::message::frontend::xa_recover), and
+/// [`xa_end_tran`](crate::message::frontend::xa_end_tran) for distributed
+/// transaction management.
+///
+/// # Wire format
+///
+/// ```text
+/// [4 bytes] format_id              (big-endian i32)
+/// [4 bytes] gtrid_length           (big-endian i32)
+/// [4 bytes] bqual_length           (big-endian i32)
+/// [N bytes] global_transaction_id  (gtrid_length bytes)
+/// [M bytes] branch_qualifier       (bqual_length bytes)
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Xid {
+    /// Identifies the format of the global transaction ID and branch qualifier.
+    pub format_id: i32,
+    /// The global transaction identifier (max 64 bytes per X/Open spec).
+    pub global_transaction_id: Vec<u8>,
+    /// The branch qualifier (max 64 bytes per X/Open spec).
+    pub branch_qualifier: Vec<u8>,
+}
+
+impl Xid {
+    /// Create a new XA transaction identifier.
+    pub fn new(format_id: i32, gtrid: Vec<u8>, bqual: Vec<u8>) -> Self {
+        Self {
+            format_id,
+            global_transaction_id: gtrid,
+            branch_qualifier: bqual,
+        }
+    }
+
+    /// Serialize this XID into the CUBRID wire format.
+    pub fn encode(&self) -> Vec<u8> {
+        let total = 12 + self.global_transaction_id.len() + self.branch_qualifier.len();
+        let mut buf = Vec::with_capacity(total);
+        buf.extend_from_slice(&self.format_id.to_be_bytes());
+        buf.extend_from_slice(&(self.global_transaction_id.len() as i32).to_be_bytes());
+        buf.extend_from_slice(&(self.branch_qualifier.len() as i32).to_be_bytes());
+        buf.extend_from_slice(&self.global_transaction_id);
+        buf.extend_from_slice(&self.branch_qualifier);
+        buf
+    }
+
+    /// Deserialize an XID from the CUBRID wire format.
+    pub fn decode(data: &[u8]) -> Result<Self, Error> {
+        if data.len() < 12 {
+            return Err(Error::InvalidMessage(format!(
+                "XID too short: {} bytes (need at least 12)",
+                data.len()
+            )));
+        }
+        let format_id = i32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        let gtrid_len = i32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
+        let bqual_len = i32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
+        let expected = 12 + gtrid_len + bqual_len;
+        if data.len() < expected {
+            return Err(Error::InvalidMessage(format!(
+                "XID truncated: {} bytes (expected {})",
+                data.len(),
+                expected
+            )));
+        }
+        let gtrid = data[12..12 + gtrid_len].to_vec();
+        let bqual = data[12 + gtrid_len..12 + gtrid_len + bqual_len].to_vec();
+        Ok(Xid {
+            format_id,
+            global_transaction_id: gtrid,
+            branch_qualifier: bqual,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1317,6 +1436,56 @@ mod tests {
     fn test_dbms_type_invalid() {
         assert!(DbmsType::try_from(4).is_err());
         assert!(DbmsType::try_from(255).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // XaOp tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_xa_op_round_trip() {
+        assert_eq!(u8::from(XaOp::try_from(1u8).unwrap()), 1);
+        assert_eq!(u8::from(XaOp::try_from(2u8).unwrap()), 2);
+    }
+
+    #[test]
+    fn test_xa_op_invalid() {
+        assert!(XaOp::try_from(0u8).is_err());
+        assert!(XaOp::try_from(3u8).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Xid tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_xid_encode_decode_round_trip() {
+        let xid = Xid::new(1, b"global-tx-1".to_vec(), b"branch-1".to_vec());
+        let encoded = xid.encode();
+        let decoded = Xid::decode(&encoded).unwrap();
+        assert_eq!(xid, decoded);
+    }
+
+    #[test]
+    fn test_xid_encode_empty_qualifiers() {
+        let xid = Xid::new(0, vec![], vec![]);
+        let encoded = xid.encode();
+        assert_eq!(encoded.len(), 12); // header only
+        let decoded = Xid::decode(&encoded).unwrap();
+        assert_eq!(xid, decoded);
+    }
+
+    #[test]
+    fn test_xid_decode_too_short() {
+        assert!(Xid::decode(&[0; 11]).is_err());
+    }
+
+    #[test]
+    fn test_xid_decode_truncated_data() {
+        let xid = Xid::new(1, b"abcd".to_vec(), b"ef".to_vec());
+        let encoded = xid.encode();
+        // Truncate before branch qualifier
+        assert!(Xid::decode(&encoded[..15]).is_err());
     }
 
     // -----------------------------------------------------------------------

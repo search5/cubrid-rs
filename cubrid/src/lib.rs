@@ -33,9 +33,8 @@ pub use tokio_cubrid::Statement;
 pub use tokio_cubrid::{Column, CubridDialect, CubridVersion};
 pub use tokio_cubrid::MakeTlsConnect;
 
-// Re-export SchemaType and BrokerInfo for use with Client metadata methods.
-pub use tokio_cubrid::SchemaType;
-pub use cubrid_protocol::authentication::BrokerInfo;
+// Re-export protocol types for use with Client metadata and advanced methods.
+pub use tokio_cubrid::{DbParameter, SchemaType, XaOp, Xid, LobType};
 
 // Re-export ToSql / FromSql traits so users do not need cubrid-types in
 // their own Cargo.toml.

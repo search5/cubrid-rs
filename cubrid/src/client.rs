@@ -5,8 +5,8 @@
 //! This mirrors the relationship between the `postgres` and `tokio-postgres`
 //! crates in the rust-postgres ecosystem.
 
-use cubrid_protocol::authentication::BrokerInfo;
-use cubrid_types::ToSql;
+use cubrid_protocol::types::{DbParameter, XaOp, Xid};
+use cubrid_types::{CubridLobHandle, CubridOid, LobType, ToSql};
 use tokio::net::TcpStream;
 use tokio::runtime::Runtime;
 
@@ -130,21 +130,6 @@ impl Client {
         self.inner().query_timeout_ms()
     }
 
-    /// Returns the broker information from the initial handshake.
-    ///
-    /// Useful for debugging and monitoring: exposes the DBMS type, protocol
-    /// version, statement pooling capability, and other broker metadata.
-    pub fn broker_info(&self) -> &BrokerInfo {
-        self.inner().broker_info()
-    }
-
-    /// Returns the session ID assigned by the server.
-    ///
-    /// The session ID is a 20-byte opaque token used by the CUBRID server
-    /// to maintain session state. Exposed for debugging and monitoring.
-    pub fn session_id(&self) -> &[u8; 20] {
-        self.inner().session_id()
-    }
 
     // -----------------------------------------------------------------------
     // Query API
@@ -233,10 +218,156 @@ impl Client {
         self.runtime.block_on(self.inner().batch_execute(sqls))
     }
 
+    /// Execute a non-SELECT SQL statement using PREPARE_AND_EXECUTE (FC 41)
+    /// in a single network round-trip. Returns the number of affected rows.
+    pub fn prepare_and_execute_sql(&self, sql: &str) -> Result<u64, Error> {
+        self.runtime
+            .block_on(self.inner().prepare_and_execute_sql(sql))
+    }
+
+    /// Execute a SELECT query using PREPARE_AND_EXECUTE (FC 41) in a single
+    /// network round-trip. Returns all result rows.
+    pub fn prepare_and_query_sql(&self, sql: &str) -> Result<Vec<Row>, Error> {
+        self.runtime
+            .block_on(self.inner().prepare_and_query_sql(sql))
+    }
+
     /// Close a prepared statement handle on the server.
     pub fn close_statement(&self, statement: &Statement) -> Result<(), Error> {
         self.runtime
             .block_on(self.inner().close_statement(statement))
+    }
+
+    // -----------------------------------------------------------------------
+    // Database parameter API
+    // -----------------------------------------------------------------------
+
+    /// Retrieve the value of a database session parameter.
+    pub fn get_db_parameter(&self, param: DbParameter) -> Result<i32, Error> {
+        self.runtime.block_on(self.inner().get_db_parameter(param))
+    }
+
+    /// Set a database session parameter value.
+    pub fn set_db_parameter(&self, param: DbParameter, value: i32) -> Result<(), Error> {
+        self.runtime
+            .block_on(self.inner().set_db_parameter(param, value))
+    }
+
+    /// Retrieve the number of rows affected by the last executed statement.
+    pub fn get_row_count(&self) -> Result<i64, Error> {
+        self.runtime.block_on(self.inner().get_row_count())
+    }
+
+    /// Retrieve the last auto-generated insert ID.
+    pub fn get_last_insert_id(&self) -> Result<String, Error> {
+        self.runtime.block_on(self.inner().get_last_insert_id())
+    }
+
+    /// Close a server-side cursor.
+    pub fn cursor_close(&self, query_handle: i32) -> Result<(), Error> {
+        self.runtime.block_on(self.inner().cursor_close(query_handle))
+    }
+
+    // -----------------------------------------------------------------------
+    // LOB API
+    // -----------------------------------------------------------------------
+
+    /// Create a new empty LOB on the server.
+    pub fn lob_new(&self, lob_type: LobType) -> Result<CubridLobHandle, Error> {
+        self.runtime.block_on(self.inner().lob_new(lob_type))
+    }
+
+    /// Write data to a LOB at the specified byte offset.
+    pub fn lob_write(&self, lob_handle: &CubridLobHandle, offset: i64, data: &[u8]) -> Result<i32, Error> {
+        self.runtime
+            .block_on(self.inner().lob_write(lob_handle, offset, data))
+    }
+
+    /// Read data from a LOB at the specified byte offset.
+    pub fn lob_read(&self, lob_handle: &CubridLobHandle, offset: i64, length: i32) -> Result<Vec<u8>, Error> {
+        self.runtime
+            .block_on(self.inner().lob_read(lob_handle, offset, length))
+    }
+
+    // -----------------------------------------------------------------------
+    // OID API
+    // -----------------------------------------------------------------------
+
+    /// Retrieve attribute values for an object identified by OID.
+    pub fn oid_get(&self, oid: &CubridOid, attrs: &[&str]) -> Result<Vec<Row>, Error> {
+        self.runtime.block_on(self.inner().oid_get(oid, attrs))
+    }
+
+    /// Update attribute values on an object identified by OID.
+    pub fn oid_put(
+        &self,
+        oid: &CubridOid,
+        attrs: &[&str],
+        values: &[&(dyn ToSql + Sync)],
+    ) -> Result<(), Error> {
+        self.runtime
+            .block_on(self.inner().oid_put(oid, attrs, values))
+    }
+
+    // -----------------------------------------------------------------------
+    // Advanced result set API
+    // -----------------------------------------------------------------------
+
+    /// Advance to the next result set in a multi-result query.
+    pub fn next_result(&self, query_handle: i32) -> Result<i32, Error> {
+        self.runtime.block_on(self.inner().next_result(query_handle))
+    }
+
+    /// Update a row at the given cursor position.
+    pub fn cursor_update(
+        &self,
+        query_handle: i32,
+        cursor_pos: i32,
+        values: &[&(dyn ToSql + Sync)],
+    ) -> Result<(), Error> {
+        self.runtime
+            .block_on(self.inner().cursor_update(query_handle, cursor_pos, values))
+    }
+
+    /// Retrieve auto-generated keys from the last INSERT statement.
+    pub fn get_generated_keys(&self, query_handle: i32) -> Result<Vec<i64>, Error> {
+        self.runtime
+            .block_on(self.inner().get_generated_keys(query_handle))
+    }
+
+    // -----------------------------------------------------------------------
+    // XA distributed transaction API
+    // -----------------------------------------------------------------------
+
+    /// Prepare an XA transaction for commit (first phase of 2PC).
+    pub fn xa_prepare(&self, xid: &Xid) -> Result<(), Error> {
+        self.runtime.block_on(self.inner().xa_prepare(xid))
+    }
+
+    /// Retrieve the list of in-doubt (prepared) XA transactions.
+    pub fn xa_recover(&self) -> Result<Vec<Xid>, Error> {
+        self.runtime.block_on(self.inner().xa_recover())
+    }
+
+    /// Commit or rollback a prepared XA transaction (second phase of 2PC).
+    pub fn xa_end_tran(&self, xid: &Xid, op: XaOp) -> Result<(), Error> {
+        self.runtime.block_on(self.inner().xa_end_tran(xid, op))
+    }
+
+    // -----------------------------------------------------------------------
+    // Schema inheritance queries
+    // -----------------------------------------------------------------------
+
+    /// List the direct parent (super) classes of a table.
+    pub fn list_super_classes(&self, table_name: &str) -> Result<Vec<String>, Error> {
+        self.runtime
+            .block_on(self.inner().list_super_classes(table_name))
+    }
+
+    /// List the direct child (sub) classes of a table.
+    pub fn list_sub_classes(&self, table_name: &str) -> Result<Vec<String>, Error> {
+        self.runtime
+            .block_on(self.inner().list_sub_classes(table_name))
     }
 
     // -----------------------------------------------------------------------
